@@ -25,8 +25,10 @@ import os
 import pathlib
 import signal
 import sys
+import threading
 import time
 import uuid
+from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Optional
@@ -35,6 +37,12 @@ import mlx.core as mx
 import yaml
 from mlx_lm import generate, load
 
+from mlx_flash_compress.chat_profiles import (
+    ChatTemplateProfileError,
+    chat_template_profile,
+    format_chat_messages,
+    validate_chat_template_kwargs,
+)
 from mlx_flash_compress.hardware import detect_hardware
 from mlx_flash_compress.log_config import setup_logging
 from mlx_flash_compress.memory_manager import MemoryManager, get_memory_state
@@ -48,6 +56,17 @@ SPECULATIVE_ENGINES = ("eagle3", "layerskip", "dflash", "none")
 
 # Path to the model registry YAML
 MODELS_YAML = pathlib.Path(__file__).parent.parent / "scripts" / "models.yaml"
+
+
+def native_state_operation(handler):
+    """Keep administrative native operations exclusive with unbatched chat."""
+
+    @wraps(handler)
+    def locked(self, *args, **kwargs):
+        with self.server_state.chat_lock:
+            return handler(self, *args, **kwargs)
+
+    return locked
 
 
 def load_model_registry() -> dict:
@@ -88,6 +107,7 @@ class InferenceState:
         self.request_timeout = request_timeout
         self.engine = None  # ContinuousBatchingEngine, created after model load
         self.spec_engine = None  # Speculative decoding engine, created after model load
+        self.chat_lock = threading.RLock()
 
         # Hardware telemetry
         self.telemetry = HardwareTelemetry()
@@ -412,13 +432,7 @@ class InferenceState:
 
     def _format_messages(self, messages: list[dict]) -> str:
         """Format chat messages for the model."""
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            try:
-                return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        # Fallback: join messages
-        return "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages)
+        return format_chat_messages(self.tokenizer, messages)
 
 
 class ChatHandler(BaseHTTPRequestHandler):
@@ -467,6 +481,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "speculative_engine": state.speculative,
                     "memory_pressure": mem.pressure_level,
                     "uptime_s": round(time.monotonic() - state.start_time, 0),
+                    "capabilities": {"chat_template_kwargs": [] if state.batching else ["enable_thinking"]},
                 }
             )
         elif self.path == "/status":
@@ -475,7 +490,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             hints = self.server_state.mem_mgr.get_optimization_hints()
             self._send_json({"hints": hints})
         elif self.path == "/release":
-            result = self.server_state.mem_mgr.auto_release_if_needed()
+            with self.server_state.chat_lock:
+                result = self.server_state.mem_mgr.auto_release_if_needed()
             self._send_json(result)
         elif self.path == "/metrics":
             self._serve_metrics()
@@ -514,6 +530,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         else:
             self._send_json({"error": "Not found"}, 404)
 
+    @native_state_operation
     def _handle_switch(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
@@ -657,6 +674,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             config["speculative_stats"] = state.spec_engine.get_stats()
         self._send_json(config)
 
+    @native_state_operation
     def _handle_config_set(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
@@ -682,6 +700,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             updated.append("batching")
         self._send_json({"updated": updated, "status": "ok"})
 
+    @native_state_operation
     def _handle_profile(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
@@ -757,6 +776,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             }
         )
 
+    @native_state_operation
     def _handle_profile_batch(self):
         """Profile multiple models from the registry sequentially."""
         content_length = int(self.headers.get("Content-Length", 0))
@@ -865,6 +885,36 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Invalid JSON"}, 400)
             return
 
+        if not isinstance(data, dict):
+            self._send_json({"error": "Expected a JSON object"}, 400)
+            return
+        try:
+            options = validate_chat_template_kwargs(data.get("chat_template_kwargs", {}))
+        except ValueError as error:
+            self._send_json({"error": str(error)}, 400)
+            return
+        state = self.server_state
+        try:
+            with state.chat_lock:
+                if options and state.batching:
+                    self._send_json(
+                        {"error": "Request thinking profiles are unsupported with continuous batching"}, 400
+                    )
+                    return
+                use_batch = state.batching and state.engine is not None
+                if not use_batch:
+                    with chat_template_profile(options):
+                        self._handle_chat_data(data, use_batch=False)
+                    return
+            # Preserve worker concurrency with a dispatch mode captured under
+            # the same lock as configuration changes. Batch workers do not
+            # inherit request profiles.
+            self._handle_chat_data(data, use_batch=True)
+        except ChatTemplateProfileError as error:
+            self._send_json({"error": str(error)}, 400)
+
+    def _handle_chat_data(self, data, *, use_batch=False):
+
         messages = data.get("messages", [])
         max_tokens = data.get("max_tokens", 256)
         temperature = data.get("temperature", 0.7)
@@ -877,7 +927,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         state = self.server_state
 
         # Route through continuous batching engine when enabled
-        if state.batching and state.engine is not None:
+        if use_batch:
             if stream:
                 self._handle_stream_batched(messages, max_tokens, temperature)
             else:

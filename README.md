@@ -4,6 +4,8 @@
 
 <h1 align="center">MLX-Flash</h1>
 
+The Chat Completions server supports [request-scoped Qwen thinking profiles](docs/chat-profiles.md) through `chat_template_kwargs.enable_thinking`.
+
 <p align="center"><strong>Run AI models too large for your Mac's memory — at near-full speed.</strong></p>
 <p align="center">70B on 32 GB. 200B+ on 48 GB. No extra quantization — uses the model's native precision.</p>
 

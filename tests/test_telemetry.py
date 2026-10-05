@@ -161,7 +161,9 @@ class TestHardwareTelemetry:
         """Test that sample returns zeros when all commands fail."""
         mock_cmd.return_value = ""
         tel = self._make_telemetry()
-        s = tel.sample()
+        # Exercise command fallback rather than reading this host via psutil.
+        with patch.dict("sys.modules", {"psutil": None}):
+            s = tel.sample()
 
         assert s.gpu_util_pct == 0.0
         assert s.power_watts == 0.0
