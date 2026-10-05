@@ -46,6 +46,7 @@ from mlx_flash_compress.chat_profiles import (
 from mlx_flash_compress.hardware import detect_hardware
 from mlx_flash_compress.log_config import setup_logging
 from mlx_flash_compress.memory_manager import MemoryManager, get_memory_state
+from mlx_flash_compress.telemetry import HardwareTelemetry
 
 # Module-level logger, configured in main()
 logger = None
@@ -78,6 +79,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """HTTP server that handles each request in a new thread."""
 
     daemon_threads = True
+    allow_reuse_address = True
 
 
 class InferenceState:
@@ -106,6 +108,9 @@ class InferenceState:
         self.engine = None  # ContinuousBatchingEngine, created after model load
         self.spec_engine = None  # Speculative decoding engine, created after model load
         self.chat_lock = threading.RLock()
+
+        # Hardware telemetry
+        self.telemetry = HardwareTelemetry()
 
         # Stats
         self.total_requests = 0
@@ -142,6 +147,9 @@ class InferenceState:
             try:
                 from huggingface_hub import snapshot_download
 
+                if hasattr(self, "_switch_progress") and self._switch_progress:
+                    self._switch_progress["phase"] = "downloading"
+                    self._switch_progress["percent"] = 15
                 log.info("Downloading model files", extra={"model": self.model_name, "action": "download_start"})
                 snapshot_download(
                     self.model_name,
@@ -150,6 +158,10 @@ class InferenceState:
                 log.info("Download complete", extra={"model": self.model_name, "action": "download_complete"})
             except Exception:
                 pass  # mlx_lm.load will handle download as fallback
+
+        if hasattr(self, "_switch_progress") and self._switch_progress:
+            self._switch_progress["phase"] = "loading"
+            self._switch_progress["percent"] = 50
 
         t0 = time.monotonic()
         self.model, self.tokenizer = load(self.model_name)
@@ -163,6 +175,10 @@ class InferenceState:
                 "action": "model_load_complete",
             },
         )
+
+        if hasattr(self, "_switch_progress") and self._switch_progress:
+            self._switch_progress["phase"] = "warming"
+            self._switch_progress["percent"] = 85
 
         # Warmup: compile Metal shaders and allocate KV cache
         log.info("Warming up (compiling Metal shaders)", extra={"action": "warmup_start"})
@@ -487,6 +503,12 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._serve_dashboard_html()
         elif self.path == "/profile/models":
             self._handle_profile_models()
+        elif self.path == "/telemetry":
+            self._handle_telemetry()
+        elif self.path == "/telemetry/current":
+            self._handle_telemetry_current()
+        elif self.path == "/switch/progress":
+            self._handle_switch_progress()
         else:
             self._send_json({"error": "Not found"}, 404)
 
@@ -529,6 +551,21 @@ class ChatHandler(BaseHTTPRequestHandler):
         log = logger or __import__("logging").getLogger("mlx_flash")
         log.info("Switching model", extra={"model": new_model, "action": "model_switch"})
 
+        # Check if model is cached before starting
+        is_cached = False
+        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+        dir_name = f"models--{new_model.replace('/', '--')}"
+        if os.path.isdir(os.path.join(cache_dir, dir_name)):
+            is_cached = True
+
+        # Update switch progress for polling
+        state._switch_progress = {
+            "phase": "unloading",
+            "model": new_model,
+            "cached": is_cached,
+            "percent": 0,
+        }
+
         # Unload current model
         state.model = None
         state.tokenizer = None
@@ -542,8 +579,12 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         # Load new model
         state.model_name = new_model
+        state._switch_progress["phase"] = "downloading" if not is_cached else "loading"
+        state._switch_progress["percent"] = 10
+
         try:
             state.load_model()
+            state._switch_progress = None
             self._send_json(
                 {
                     "switched": True,
@@ -552,6 +593,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 }
             )
         except Exception as e:
+            state._switch_progress = None
             # Rollback on failure
             state.model_name = old_model
             self._send_json(
@@ -562,6 +604,15 @@ class ChatHandler(BaseHTTPRequestHandler):
                 },
                 500,
             )
+
+    def _handle_switch_progress(self):
+        """Return current model switch progress for UI polling."""
+        state = self.server_state
+        progress = getattr(state, "_switch_progress", None)
+        if progress is None:
+            self._send_json({"switching": False, "model": state.model_name, "model_loaded": state.model is not None})
+        else:
+            self._send_json({"switching": True, **progress})
 
     def _handle_reload(self):
         """Reload: refresh memory state, log status."""
@@ -1249,6 +1300,30 @@ async function poll(){try{const s=await fetch('/status').then(r=>r.json()),m=s.m
 poll();setInterval(poll,2000);
 </script></body></html>"""
 
+    def _handle_telemetry(self):
+        """Return current telemetry sample plus 120-sample history."""
+        state = self.server_state
+        stats = state.telemetry.get_stats()
+        history = state.telemetry.get_history(seconds=120)
+        self._send_json(
+            {
+                "current": stats.get("current", {}),
+                "stats": {
+                    "samples_count": stats.get("samples_count", 0),
+                    "avg": stats.get("avg", {}),
+                    "max": stats.get("max", {}),
+                    "min": stats.get("min", {}),
+                },
+                "history": history,
+            }
+        )
+
+    def _handle_telemetry_current(self):
+        """Return just the current telemetry sample."""
+        state = self.server_state
+        sample = state.telemetry.sample()
+        self._send_json(sample.to_dict())
+
     def _send_json(self, data: dict, status: int = 200):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -1377,6 +1452,10 @@ def main():
 
     ChatHandler.server_state = state
 
+    # Start hardware telemetry sampling
+    state.telemetry.start_sampling(interval_ms=1000)
+    logger.info("Hardware telemetry started", extra={"action": "telemetry_start", "interval_ms": 1000})
+
     server = ThreadedHTTPServer((args.host, args.port), ChatHandler)
     logger.info(
         "Server listening",
@@ -1392,6 +1471,7 @@ def main():
         logger.info(
             f"Received {sig_name}, shutting down gracefully", extra={"action": "server_stop", "signal": sig_name}
         )
+        state.telemetry.stop_sampling()
         server.shutdown()
 
     signal.signal(signal.SIGTERM, _graceful_shutdown)
@@ -1401,6 +1481,7 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down", extra={"action": "server_stop"})
+        state.telemetry.stop_sampling()
         server.shutdown()
 
 
