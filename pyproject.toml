@@ -66,6 +66,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["mlx_flash_compress*"]
 
+[tool.setuptools.package-data]
+"mlx_flash_compress.kernels" = ["*.metal"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
