@@ -257,3 +257,29 @@ class TestChatRequestProfiles:
                 thread.join(timeout=2)
         assert completed.is_set()
         assert state.model_name == "replacement"
+
+    def test_profile_checks_batching_after_acquiring_native_lock(self):
+        state = _make_state()
+        state.generate = MagicMock()
+        handler = self.handler(
+            state,
+            {"messages": [{"role": "user", "content": "Hello"}], "chat_template_kwargs": {"enable_thinking": True}},
+        )
+        started = threading.Event()
+
+        def request():
+            started.set()
+            handler._handle_chat()
+
+        thread = threading.Thread(target=request)
+        try:
+            with state.chat_lock:
+                thread.start()
+                assert started.wait(1)
+                state.batching = True
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            assert handler.responses[0][0] == 400
+            state.generate.assert_not_called()
+        finally:
+            thread.join(timeout=2)

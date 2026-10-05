@@ -843,22 +843,26 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(error)}, 400)
             return
         state = self.server_state
-        if options and state.batching:
-            self._send_json({"error": "Request thinking profiles are unsupported with continuous batching"}, 400)
-            return
-        # Batch workers do not inherit ContextVars; keep their legacy path and
-        # concurrency when no request profile is present. Native unbatched
-        # model operations must not overlap on the shared model/tokenizer.
-        if state.batching:
-            self._handle_chat_data(data)
-            return
         try:
-            with state.chat_lock, chat_template_profile(options):
-                self._handle_chat_data(data)
+            with state.chat_lock:
+                if options and state.batching:
+                    self._send_json(
+                        {"error": "Request thinking profiles are unsupported with continuous batching"}, 400
+                    )
+                    return
+                use_batch = state.batching and state.engine is not None
+                if not use_batch:
+                    with chat_template_profile(options):
+                        self._handle_chat_data(data, use_batch=False)
+                    return
+            # Preserve worker concurrency with a dispatch mode captured under
+            # the same lock as configuration changes. Batch workers do not
+            # inherit request profiles.
+            self._handle_chat_data(data, use_batch=True)
         except ChatTemplateProfileError as error:
             self._send_json({"error": str(error)}, 400)
 
-    def _handle_chat_data(self, data):
+    def _handle_chat_data(self, data, *, use_batch=False):
 
         messages = data.get("messages", [])
         max_tokens = data.get("max_tokens", 256)
@@ -872,7 +876,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         state = self.server_state
 
         # Route through continuous batching engine when enabled
-        if state.batching and state.engine is not None:
+        if use_batch:
             if stream:
                 self._handle_stream_batched(messages, max_tokens, temperature)
             else:
