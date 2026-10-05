@@ -1,7 +1,9 @@
 """Tests for the inference server (no model loading)."""
 
+import io
 import json
 import sys
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -141,3 +143,117 @@ class TestInferenceState:
         state = _make_state("my-custom-model")
         with patch(MEM_PATCH, return_value=_make_fake_mem()):
             assert state.get_status()["model"] == "my-custom-model"
+
+
+class TestChatRequestProfiles:
+    @staticmethod
+    def handler(state, payload):
+        from mlx_flash_compress.serve import ChatHandler
+
+        body = json.dumps(payload).encode()
+        handler = object.__new__(ChatHandler)
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.server_state = state
+        handler.responses = []
+        handler._send_json = lambda data, status=200: handler.responses.append((status, data))
+        return handler
+
+    def test_http_profile_changes_actual_prompt(self):
+        from mlx_flash_compress.chat_profiles import current_chat_template_kwargs
+
+        class Tokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                return messages[0]["content"] + (" THINK" if kwargs.get("enable_thinking") else " DIRECT")
+
+        state = _make_state()
+        state.tokenizer = Tokenizer()
+        state.generate = lambda messages, *args: {
+            "output": state._format_messages(messages),
+            "tokens": 2,
+            "tok_per_s": 1,
+            "memory_pressure": "normal",
+        }
+        for thinking, suffix in ((True, "THINK"), (False, "DIRECT")):
+            handler = self.handler(
+                state,
+                {
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "chat_template_kwargs": {"enable_thinking": thinking},
+                },
+            )
+            handler._handle_chat()
+            status, response = handler.responses[0]
+            assert status == 200
+            assert response["choices"][0]["message"]["content"] == "Hello " + suffix
+            assert current_chat_template_kwargs() == {}
+
+    def test_http_bad_profile_and_batching_never_generate(self):
+        state = _make_state()
+
+        def forbidden(*args):
+            pytest.fail("invalid/unsupported profile reached generation")
+
+        state.generate = forbidden
+        for options in ({"enable_thinking": "false"}, {"unknown": True}, None):
+            handler = self.handler(
+                state, {"messages": [{"role": "user", "content": "Hello"}], "chat_template_kwargs": options}
+            )
+            handler._handle_chat()
+            assert handler.responses[0][0] == 400
+        state.batching = True
+        handler = self.handler(
+            state,
+            {"messages": [{"role": "user", "content": "Hello"}], "chat_template_kwargs": {"enable_thinking": False}},
+        )
+        handler._handle_chat()
+        assert handler.responses[0][0] == 400
+
+    def test_http_generation_failure_restores_profile(self):
+        from mlx_flash_compress.chat_profiles import current_chat_template_kwargs
+
+        state = _make_state()
+
+        def fail(*args):
+            assert current_chat_template_kwargs() == {"enable_thinking": True}
+            raise RuntimeError("native generation failed")
+
+        state.generate = fail
+        handler = self.handler(
+            state,
+            {"messages": [{"role": "user", "content": "Hello"}], "chat_template_kwargs": {"enable_thinking": True}},
+        )
+        with pytest.raises(RuntimeError, match="generation failed"):
+            handler._handle_chat()
+        assert current_chat_template_kwargs() == {}
+
+    def test_model_switch_waits_for_shared_native_state(self):
+        state = _make_state("original")
+        state.model = object()
+        state.tokenizer = object()
+        original_tokenizer = state.tokenizer
+        entered = threading.Event()
+        completed = threading.Event()
+
+        def load():
+            entered.set()
+
+        state.load_model = load
+        handler = self.handler(state, {"model": "replacement"})
+
+        def switch():
+            handler._handle_switch()
+            completed.set()
+
+        with patch(MX_PATCH):
+            thread = threading.Thread(target=switch)
+            try:
+                with state.chat_lock:
+                    thread.start()
+                    assert not entered.wait(0.05)
+                    assert state.model_name == "original"
+                    assert state.tokenizer is original_tokenizer
+            finally:
+                thread.join(timeout=2)
+        assert completed.is_set()
+        assert state.model_name == "replacement"
