@@ -21,6 +21,8 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
+from native_api_proofs import run_native_proofs
+
 MARKER = "QWEN_ROLE_READY"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -372,10 +374,20 @@ def run(args, results, raw):
                         }
                     )
 
+            if args.integration_proofs:
+                print(f"Running native API/cache proofs: {name}.", flush=True)
+                family = json.loads((model / "config.json").read_text())["model_type"]
+                run_native_proofs(OPENER, request, health["capabilities"], family, profiles, results["checks"], name)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gateway", help="Fresh Sentinel gateway binary (otherwise test native Chat Completions)")
+    parser.add_argument(
+        "--integration-proofs",
+        action="store_true",
+        help="Also verify native cache, API/SSE, validation, accounting, and release",
+    )
     parser.add_argument("--artifacts", default="qwen-metal-artifacts")
     args = parser.parse_args()
     artifacts = Path(args.artifacts)
