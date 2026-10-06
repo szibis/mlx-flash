@@ -260,9 +260,7 @@ class GenerationMeasurementsTests(unittest.TestCase):
     def test_buffered_sse_preserves_cross_origin_browser_access(self):
         obj = handler(state(), {"messages": [{"role": "user", "content": "fixture"}], "stream": True})
         obj._handle_chat()
-        self.assertIn(
-            ("Access-Control-Allow-Origin", "*"), [call.args for call in obj.send_header.call_args_list]
-        )
+        self.assertIn(("Access-Control-Allow-Origin", "*"), [call.args for call in obj.send_header.call_args_list])
 
     def test_speculative_eos_inside_accepted_block_reports_stop(self):
         value = state()

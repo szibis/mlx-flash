@@ -4,6 +4,50 @@ The standard unbatched chat path obtains text and accounting from `mlx_lm.stream
 
 Each standard chat response includes `mlx_flash_compress.native_generation_metadata: true` and `usage_source: "exact_mlx_lm_generation"`. Clients can use this marker to distinguish actual native stop metadata from an older server that reported `stop` for every result. An incomplete native iterator is an error, not a completed response. The existing package version remains 0.8.0; inspect the capability marker rather than assuming every 0.8.0 installation has these changes.
 
+## Try a request and inspect its evidence
+
+With the updated runtime already running and its model loaded, send a request
+using the runtime's actual port (19091 is the Sentinel lab's large model):
+
+```sh
+rtk curl -s http://127.0.0.1:19091/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"local","messages":[{"role":"user","content":"Reply briefly: ready"}],"max_tokens":64,"temperature":0.1,"top_p":0.9,"top_k":20,"stream":false}'
+rtk curl -s http://127.0.0.1:19091/status
+```
+
+Inspect `usage`, `choices[0].finish_reason`, the native capability marker and
+`usage_source`, and `/status.stats.last_generation`. A successful HTTP request
+alone does not prove the marker is present. Existing processes keep their old
+code until restarted, and rebuilding Sentinel alone does not update MLX-Flash.
+
+For buffered SSE with usage in the final event:
+
+```sh
+rtk curl -N http://127.0.0.1:19091/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"local","messages":[{"role":"user","content":"Reply briefly: ready"}],"max_tokens":64,"stream":true,"stream_options":{"include_usage":true}}'
+```
+
+The server delivers content after the generation finishes. Use native timing
+fields to study inference; use client wall time to study the UI experience.
+Do not interpret buffered network events as real-time decoding throughput.
+
+## Behavior change by runtime path
+
+| Path | Before | With these changes |
+| --- | --- | --- |
+| Standard unbatched generation | Zero prompt placeholder; output re-tokenized; stop always reported | Native formatted-prompt/output counts and native stop reason |
+| Standard sampling | Requested temperature was not forwarded to the generator | Temperature/top-p/top-k reach the native sampler |
+| Standard SSE | Synthetic word chunks after generation | Buffered content from the same measured result, labeled as buffered |
+| Batching | Completion accounting/stop reasons could disagree with token arrays | Actual batch token counts and EOS/length; unsupported filters reject |
+| Speculative | EOS inside an accepted block could be classified as length | Explicit EOS anywhere in the generated block establishes stop |
+
+The capability marker is true only for standard native generation. Batch and
+speculative paths expose their own provenance and null unavailable metrics.
+
+## Meaning of each field
+
 | Field | Measurement scope |
 | --- | --- |
 | `usage.prompt_tokens` | Model input after system text, chat template, tool descriptions and history are formatted and tokenized. |
