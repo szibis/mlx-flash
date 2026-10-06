@@ -18,7 +18,14 @@ spec = importlib.util.spec_from_file_location(
 serve = importlib.util.module_from_spec(spec)
 with patch.dict(
     sys.modules,
-    {"mlx": MagicMock(), "mlx.core": MagicMock(), "mlx_lm": MagicMock(), "mlx_lm.sample_utils": MagicMock(), "mlx_lm.models": MagicMock(), "mlx_lm.models.cache": MagicMock()},
+    {
+        "mlx": MagicMock(),
+        "mlx.core": MagicMock(),
+        "mlx_lm": MagicMock(),
+        "mlx_lm.sample_utils": MagicMock(),
+        "mlx_lm.models": MagicMock(),
+        "mlx_lm.models.cache": MagicMock(),
+    },
 ):
     spec.loader.exec_module(serve)
 batch_spec = importlib.util.spec_from_file_location(

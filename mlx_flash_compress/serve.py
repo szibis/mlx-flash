@@ -137,7 +137,11 @@ class InferenceState:
         return {
             "model_family": family,
             "thinking_control": controlled and not self.batching,
-            "reasoning_format": "gemma" if family.startswith("gemma4") else "think" if controlled or family == "lfm2_moe" else "none",
+            "reasoning_format": "gemma"
+            if family.startswith("gemma4")
+            else "think"
+            if controlled or family == "lfm2_moe"
+            else "none",
             "chat_template_kwargs": ["enable_thinking"] if controlled and not self.batching else [],
         }
 
@@ -346,13 +350,22 @@ class InferenceState:
             },
             "optimization_hints": hints,
             "speculative_engine": self.speculative,
-            "prompt_cache": {**self.prompt_reuse.stats(), "enabled": self.prompt_reuse.max_bytes > 0 and not self.batching and self.speculative == "none"},
+            "prompt_cache": {
+                **self.prompt_reuse.stats(),
+                "enabled": self.prompt_reuse.max_bytes > 0 and not self.batching and self.speculative == "none",
+            },
             "optimizations": {
                 "prompt_cache": self.prompt_reuse.max_bytes > 0 and not self.batching and self.speculative == "none",
                 "speculative": self.speculative,
                 "batching": self.batching,
                 "kv_quantization_bits": self.kv_bits,
-                "repetition_penalty": (self.last_generation.get("repetition_penalty") if self.last_generation else 1.05 if self.capabilities()["model_family"] == "lfm2_moe" else None),
+                "repetition_penalty": (
+                    self.last_generation.get("repetition_penalty")
+                    if self.last_generation
+                    else 1.05
+                    if self.capabilities()["model_family"] == "lfm2_moe"
+                    else None
+                ),
             },
         }
         if self.spec_engine is not None:
@@ -366,7 +379,12 @@ class InferenceState:
         return status
 
     def generate(
-        self, messages: list[dict], max_tokens: int = 256, temperature: float = 0.7, top_p: float = 1.0, top_k: int = 0,
+        self,
+        messages: list[dict],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        top_k: int = 0,
         cache_scope: str = "default",
         repetition_penalty: Optional[float] = None,
     ) -> dict:
@@ -448,27 +466,34 @@ class InferenceState:
                 native_cache = make_prompt_cache(self.model)
             if repetition_penalty is None and self.capabilities()["model_family"] == "lfm2_moe":
                 repetition_penalty = 1.05
-            processors = make_logits_processors(repetition_penalty=repetition_penalty) if repetition_penalty is not None else []
+            processors = (
+                make_logits_processors(repetition_penalty=repetition_penalty) if repetition_penalty is not None else []
+            )
             if reused and processors:
                 # Native generate_step sees only the uncached suffix. Restore
                 # full sampling history without reprocessing the cached input.
                 prefix = mx.array(input_tokens[:reused])
                 processors = [
-                    lambda tokens, logits, fn=fn: fn(mx.concatenate([prefix, tokens]), logits)
-                    for fn in processors
+                    lambda tokens, logits, fn=fn: fn(mx.concatenate([prefix, tokens]), logits) for fn in processors
                 ]
+
             def prefill_progress(processed, total):
                 # The total==processed callback happens AFTER native decode
                 # lookahead mutates recurrent state. Only snapshot prefill.
                 if mem.pressure_level == "normal" and self.prompt_reuse.max_bytes and 0 < processed == total - 1:
-                    self.prompt_reuse.store(namespace, input_tokens[:reused + processed], native_cache)
+                    self.prompt_reuse.store(namespace, input_tokens[: reused + processed], native_cache)
 
             segments = []
             last = None
             ttft_ms = None
             for response in stream_generate(
-                self.model, self.tokenizer, prompt=rest, max_tokens=max_tokens, sampler=sampler,
-                prompt_cache=native_cache, prompt_progress_callback=prefill_progress,
+                self.model,
+                self.tokenizer,
+                prompt=rest,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                prompt_cache=native_cache,
+                prompt_progress_callback=prefill_progress,
                 kv_bits=self.kv_bits or None,
                 logits_processors=processors,
             ):
@@ -1181,11 +1206,24 @@ class ChatHandler(BaseHTTPRequestHandler):
             response["mlx_flash_compress"]["speculative_stats"] = result["speculative_stats"]
         self._send_json(response)
 
-    def _handle_stream(self, messages, max_tokens, temperature, top_p=1.0, top_k=0, *, include_usage=False, cache_scope="default", repetition_penalty=None):
+    def _handle_stream(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        top_p=1.0,
+        top_k=0,
+        *,
+        include_usage=False,
+        cache_scope="default",
+        repetition_penalty=None,
+    ):
         """Send an explicitly buffered SSE response using the native result."""
         state = self.server_state
         sampling = {"repetition_penalty": repetition_penalty} if repetition_penalty is not None else {}
-        result = state.generate(messages, max_tokens, temperature, top_p=top_p, top_k=top_k, cache_scope=cache_scope, **sampling)
+        result = state.generate(
+            messages, max_tokens, temperature, top_p=top_p, top_k=top_k, cache_scope=cache_scope, **sampling
+        )
         if "error" in result:
             self._send_json({"error": result["error"]}, 503)
             return
@@ -1580,8 +1618,12 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--preload", action="store_true", help="Load model immediately")
-    parser.add_argument("--prompt-cache-bytes", type=int, default=512 * 1024 * 1024,
-                        help="Maximum retained native prompt state bytes; 0 disables reuse (default 512 MiB)")
+    parser.add_argument(
+        "--prompt-cache-bytes",
+        type=int,
+        default=512 * 1024 * 1024,
+        help="Maximum retained native prompt state bytes; 0 disables reuse (default 512 MiB)",
+    )
     parser.add_argument("--prompt-cache-entries", type=int, default=8, help="Maximum prompt snapshots (default 8)")
     parser.add_argument(
         "--kv-bits",
