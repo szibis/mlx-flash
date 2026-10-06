@@ -4,6 +4,12 @@ All notable changes to MLX-Flash are documented here.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-06
+
+### Changes
+- test: gate native cache and API contracts on real MLX proofs (#23)
+- fix: use configured Python for Metal revision artifacts (#24)
+
 ## [0.9.0] - 2026-10-06
 
 ### Changes
