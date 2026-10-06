@@ -37,17 +37,20 @@ from typing import Optional
 import mlx.core as mx
 import yaml
 from mlx_lm import generate, load, stream_generate
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
 from mlx_flash_compress.chat_profiles import (
     ChatTemplateProfileError,
     chat_template_profile,
+    current_chat_template_kwargs,
     format_chat_messages,
     validate_chat_template_kwargs,
 )
 from mlx_flash_compress.hardware import detect_hardware
 from mlx_flash_compress.log_config import setup_logging
 from mlx_flash_compress.memory_manager import MemoryManager, get_memory_state
+from mlx_flash_compress.prompt_reuse import PromptReuse
 from mlx_flash_compress.telemetry import HardwareTelemetry
 
 # Module-level logger, configured in main()
@@ -96,6 +99,8 @@ class InferenceState:
         speculative: str = "none",
         request_timeout: float = 120.0,
         safety_margin_gb: float = 2.0,
+        prompt_cache_bytes: int = 512 * 1024 * 1024,
+        prompt_cache_entries: int = 8,
     ):
         self.model_name = model_name
         self.model = None
@@ -110,6 +115,7 @@ class InferenceState:
         self.engine = None  # ContinuousBatchingEngine, created after model load
         self.spec_engine = None  # Speculative decoding engine, created after model load
         self.chat_lock = threading.RLock()
+        self.prompt_reuse = PromptReuse(prompt_cache_bytes, prompt_cache_entries)
 
         # Hardware telemetry
         self.telemetry = HardwareTelemetry()
@@ -120,9 +126,25 @@ class InferenceState:
         self.last_generation = None
         self.start_time = time.monotonic()
 
+    def capabilities(self):
+        family = getattr(self.model, "model_type", None)
+        if not isinstance(family, str):
+            try:
+                family = json.loads((pathlib.Path(self.model_name) / "config.json").read_text())["model_type"]
+            except (OSError, ValueError, KeyError, TypeError):
+                family = "unknown"
+        controlled = family.startswith("qwen") or family in ("gemma4", "gemma4_text")
+        return {
+            "model_family": family,
+            "thinking_control": controlled and not self.batching,
+            "reasoning_format": "gemma" if family.startswith("gemma4") else "think" if controlled or family == "lfm2_moe" else "none",
+            "chat_template_kwargs": ["enable_thinking"] if controlled and not self.batching else [],
+        }
+
     def load_model(self):
         """Load the model with memory checks."""
         global logger
+        self.prompt_reuse.clear()
         log = logger or __import__("logging").getLogger("mlx_flash")
         mem = get_memory_state()
         log.info(
@@ -324,6 +346,14 @@ class InferenceState:
             },
             "optimization_hints": hints,
             "speculative_engine": self.speculative,
+            "prompt_cache": {**self.prompt_reuse.stats(), "enabled": self.prompt_reuse.max_bytes > 0 and not self.batching and self.speculative == "none"},
+            "optimizations": {
+                "prompt_cache": self.prompt_reuse.max_bytes > 0 and not self.batching and self.speculative == "none",
+                "speculative": self.speculative,
+                "batching": self.batching,
+                "kv_quantization_bits": self.kv_bits,
+                "repetition_penalty": (self.last_generation.get("repetition_penalty") if self.last_generation else 1.05 if self.capabilities()["model_family"] == "lfm2_moe" else None),
+            },
         }
         if self.spec_engine is not None:
             try:
@@ -336,7 +366,9 @@ class InferenceState:
         return status
 
     def generate(
-        self, messages: list[dict], max_tokens: int = 256, temperature: float = 0.7, top_p: float = 1.0, top_k: int = 0
+        self, messages: list[dict], max_tokens: int = 256, temperature: float = 0.7, top_p: float = 1.0, top_k: int = 0,
+        cache_scope: str = "default",
+        repetition_penalty: Optional[float] = None,
     ) -> dict:
         """Generate a response with memory awareness."""
         if self.model is None:
@@ -347,6 +379,7 @@ class InferenceState:
         mem = get_memory_state()
         release_info = None
         if mem.pressure_level in ("critical", "warning"):
+            self.prompt_reuse.clear()
             log.warning(
                 "Memory pressure before generation",
                 extra={
@@ -406,11 +439,38 @@ class InferenceState:
                 spec_stats = self.spec_engine.get_stats_summary()
         else:
             sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
+            add_special = self.tokenizer.bos_token is None or not prompt.startswith(self.tokenizer.bos_token)
+            input_tokens = self.tokenizer.encode(prompt, add_special_tokens=add_special)
+            namespace = (self.model_name, tuple(sorted(current_chat_template_kwargs().items())), cache_scope)
+            native_cache, rest = self.prompt_reuse.lookup(namespace, input_tokens)
+            reused = len(input_tokens) - len(rest)
+            if native_cache is None:
+                native_cache = make_prompt_cache(self.model)
+            if repetition_penalty is None and self.capabilities()["model_family"] == "lfm2_moe":
+                repetition_penalty = 1.05
+            processors = make_logits_processors(repetition_penalty=repetition_penalty) if repetition_penalty is not None else []
+            if reused and processors:
+                # Native generate_step sees only the uncached suffix. Restore
+                # full sampling history without reprocessing the cached input.
+                prefix = mx.array(input_tokens[:reused])
+                processors = [
+                    lambda tokens, logits, fn=fn: fn(mx.concatenate([prefix, tokens]), logits)
+                    for fn in processors
+                ]
+            def prefill_progress(processed, total):
+                # The total==processed callback happens AFTER native decode
+                # lookahead mutates recurrent state. Only snapshot prefill.
+                if mem.pressure_level == "normal" and self.prompt_reuse.max_bytes and 0 < processed == total - 1:
+                    self.prompt_reuse.store(namespace, input_tokens[:reused + processed], native_cache)
+
             segments = []
             last = None
             ttft_ms = None
             for response in stream_generate(
-                self.model, self.tokenizer, prompt=prompt, max_tokens=max_tokens, sampler=sampler
+                self.model, self.tokenizer, prompt=rest, max_tokens=max_tokens, sampler=sampler,
+                prompt_cache=native_cache, prompt_progress_callback=prefill_progress,
+                kv_bits=self.kv_bits or None,
+                logits_processors=processors,
             ):
                 if ttft_ms is None:
                     ttft_ms = (time.monotonic() - t0) * 1000
@@ -420,8 +480,12 @@ class InferenceState:
                 raise RuntimeError("Native generator did not provide a completed response")
             output = "".join(segments)
             tokens = last.generation_tokens
+            self.prompt_reuse.record_completed(reused, len(rest))
             metrics = {
-                "prompt_tokens": last.prompt_tokens,
+                "prompt_tokens": len(input_tokens),
+                "cached_prompt_tokens": reused,
+                "processed_prompt_tokens": len(rest),
+                "repetition_penalty": repetition_penalty,
                 "finish_reason": last.finish_reason,
                 "generation_tps": last.generation_tps,
                 "prompt_tps": last.prompt_tps,
@@ -526,7 +590,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "speculative_engine": state.speculative,
                     "memory_pressure": mem.pressure_level,
                     "uptime_s": round(time.monotonic() - state.start_time, 0),
-                    "capabilities": {"chat_template_kwargs": [] if state.batching else ["enable_thinking"]},
+                    "capabilities": state.capabilities(),
                 }
             )
         elif self.path == "/status":
@@ -536,6 +600,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json({"hints": hints})
         elif self.path == "/release":
             with self.server_state.chat_lock:
+                self.server_state.prompt_reuse.clear()
                 result = self.server_state.mem_mgr.auto_release_if_needed()
             self._send_json(result)
         elif self.path == "/metrics":
@@ -614,6 +679,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         # Unload current model
         state.model = None
         state.tokenizer = None
+        state.prompt_reuse.clear()
         import gc
 
         gc.collect()
@@ -735,6 +801,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             state.cache_budget_pct = float(data["cache_budget_pct"])
             updated.append("cache_budget_pct")
         if "kv_bits" in data:
+            state.prompt_reuse.clear()
             state.kv_bits = int(data["kv_bits"])
             updated.append("kv_bits")
         if "request_timeout" in data:
@@ -911,6 +978,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         # Restore original model name (leave model unloaded to save memory)
         state.model = None
         state.tokenizer = None
+        state.prompt_reuse.clear()
         gc.collect()
         try:
             mx.clear_cache()
@@ -941,6 +1009,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         state = self.server_state
         try:
             with state.chat_lock:
+                if options and not state.capabilities()["thinking_control"]:
+                    self._send_json({"error": "Selected model does not support a thinking toggle"}, 400)
+                    return
                 if options and state.batching:
                     self._send_json(
                         {"error": "Request thinking profiles are unsupported with continuous batching"}, 400
@@ -974,9 +1045,25 @@ class ChatHandler(BaseHTTPRequestHandler):
             "stream",
             "stream_options",
             "chat_template_kwargs",
+            "cache_scope",
+            "repetition_penalty",
         }
         if set(data) - supported:
             self._send_json({"error": "Unsupported request fields: " + ", ".join(sorted(set(data) - supported))}, 400)
+            return
+        cache_scope = data.get("cache_scope", "default")
+        if not isinstance(cache_scope, str) or not cache_scope or len(cache_scope) > 128:
+            self._send_json({"error": "cache_scope must be a nonempty string of at most 128 characters"}, 400)
+            return
+        if use_batch and "cache_scope" in data:
+            self._send_json({"error": "Session-scoped prompt reuse is unsupported with continuous batching"}, 400)
+            return
+        penalty = data.get("repetition_penalty")
+        if penalty is not None and (type(penalty) not in (int, float) or not math.isfinite(penalty) or penalty <= 0):
+            self._send_json({"error": "repetition_penalty must be a positive finite number"}, 400)
+            return
+        if penalty is not None and (use_batch or self.server_state.speculative != "none"):
+            self._send_json({"error": "repetition_penalty requires standard unbatched generation"}, 400)
             return
         if (
             type(max_tokens) is not int
@@ -1039,10 +1126,14 @@ class ChatHandler(BaseHTTPRequestHandler):
                 top_p,
                 top_k,
                 include_usage=stream_options.get("include_usage", False),
+                cache_scope=cache_scope,
+                repetition_penalty=penalty,
             )
             return
 
-        sampling = {key: data[key] for key in ("top_p", "top_k") if key in data}
+        sampling = {key: data[key] for key in ("top_p", "top_k", "repetition_penalty") if key in data}
+        if "cache_scope" in data:
+            sampling["cache_scope"] = cache_scope
         result = state.generate(messages, max_tokens, temperature, **sampling)
 
         if "error" in result:
@@ -1082,16 +1173,19 @@ class ChatHandler(BaseHTTPRequestHandler):
                 "peak_memory_gb": result.get("peak_memory_gb"),
                 "native_generation_metadata": result.get("native_generation_metadata", False),
                 "usage_source": result.get("usage_source", "unknown"),
+                "cached_prompt_tokens": result.get("cached_prompt_tokens"),
+                "processed_prompt_tokens": result.get("processed_prompt_tokens"),
             },
         }
         if "speculative_stats" in result:
             response["mlx_flash_compress"]["speculative_stats"] = result["speculative_stats"]
         self._send_json(response)
 
-    def _handle_stream(self, messages, max_tokens, temperature, top_p=1.0, top_k=0, *, include_usage=False):
+    def _handle_stream(self, messages, max_tokens, temperature, top_p=1.0, top_k=0, *, include_usage=False, cache_scope="default", repetition_penalty=None):
         """Send an explicitly buffered SSE response using the native result."""
         state = self.server_state
-        result = state.generate(messages, max_tokens, temperature, top_p=top_p, top_k=top_k)
+        sampling = {"repetition_penalty": repetition_penalty} if repetition_penalty is not None else {}
+        result = state.generate(messages, max_tokens, temperature, top_p=top_p, top_k=top_k, cache_scope=cache_scope, **sampling)
         if "error" in result:
             self._send_json({"error": result["error"]}, 503)
             return
@@ -1121,6 +1215,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             "mlx_flash_compress": {
                 "native_generation_metadata": result.get("native_generation_metadata", False),
                 "usage_source": result.get("usage_source", "unknown"),
+                "cached_prompt_tokens": result.get("cached_prompt_tokens"),
+                "processed_prompt_tokens": result.get("processed_prompt_tokens"),
             },
         }
         if include_usage:
@@ -1484,6 +1580,9 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--preload", action="store_true", help="Load model immediately")
+    parser.add_argument("--prompt-cache-bytes", type=int, default=512 * 1024 * 1024,
+                        help="Maximum retained native prompt state bytes; 0 disables reuse (default 512 MiB)")
+    parser.add_argument("--prompt-cache-entries", type=int, default=8, help="Maximum prompt snapshots (default 8)")
     parser.add_argument(
         "--kv-bits",
         type=int,
@@ -1556,6 +1655,8 @@ def main():
         speculative=args.speculative,
         request_timeout=args.request_timeout,
         safety_margin_gb=args.safety_margin_gb,
+        prompt_cache_bytes=args.prompt_cache_bytes,
+        prompt_cache_entries=args.prompt_cache_entries,
     )
 
     logger.info(

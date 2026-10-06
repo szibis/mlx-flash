@@ -1,8 +1,8 @@
 """Model-free lifecycle tests; these never claim real inference coverage."""
+
+import json
 import multiprocessing
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
@@ -11,6 +11,8 @@ import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 
 import qwen_metal_smoke as smoke
@@ -48,8 +50,9 @@ class LifecycleTests(unittest.TestCase):
 
     def test_readiness_timeout_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
-            with smoke.owned_server([sys.executable, "-c", "import time; time.sleep(60)"],
-                                    Path(directory) / "server.log", os.environ.copy()) as process:
+            with smoke.owned_server(
+                [sys.executable, "-c", "import time; time.sleep(60)"], Path(directory) / "server.log", os.environ.copy()
+            ) as process:
                 with patch.object(smoke, "request", side_effect=OSError("not listening")):
                     started = time.monotonic()
                     with self.assertRaisesRegex(RuntimeError, "Timed out"):
@@ -81,8 +84,11 @@ class LifecycleTests(unittest.TestCase):
     def test_cleanup_reaps_owned_server_even_on_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(RuntimeError, "generation failed"):
-                with smoke.owned_server([sys.executable, "-c", "import time; time.sleep(60)"],
-                                        Path(directory) / "server.log", os.environ.copy()) as process:
+                with smoke.owned_server(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    Path(directory) / "server.log",
+                    os.environ.copy(),
+                ) as process:
                     raise RuntimeError("generation failed")
             self.assertIsNotNone(process.poll())
             with self.assertRaises(ProcessLookupError):
@@ -92,13 +98,18 @@ class LifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             pid_path = Path(directory) / "child.pid"
             ready = Path(directory) / "ready"
-            child_code = ("import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                          f"open({str(ready)!r},'w').close(); time.sleep(60)")
-            code = (f"import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c',{child_code!r}]); "
-                    "open(sys.argv[1],'w').write(str(p.pid)); "
-                    f"\nwhile not __import__('os').path.exists({str(ready)!r}): time.sleep(0.01)")
-            with smoke.owned_server([sys.executable, "-c", code, str(pid_path)],
-                                    Path(directory) / "server.log", os.environ.copy()) as process:
+            child_code = (
+                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"open({str(ready)!r},'w').close(); time.sleep(60)"
+            )
+            code = (
+                f"import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c',{child_code!r}]); "
+                "open(sys.argv[1],'w').write(str(p.pid)); "
+                f"\nwhile not __import__('os').path.exists({str(ready)!r}): time.sleep(0.01)"
+            )
+            with smoke.owned_server(
+                [sys.executable, "-c", code, str(pid_path)], Path(directory) / "server.log", os.environ.copy()
+            ) as process:
                 process.wait(timeout=5)
                 child_pid = int(pid_path.read_text())
             # macOS reaps orphaned children asynchronously; wait for signal delivery.
@@ -156,6 +167,132 @@ class LifecycleTests(unittest.TestCase):
             (model / "model.safetensors.index.json").write_text('{"weight_map":{"a":"missing.safetensors"}}')
             with self.assertRaisesRegex(RuntimeError, "shards"):
                 smoke.validate_model(str(model))
+
+
+class NativeFamilyTests(unittest.TestCase):
+    def test_completed_gemma_and_think_sections_require_exact_final(self):
+        for text in ("<|channel>thought\nprivate<channel|>" + smoke.MARKER, "private<channel|>" + smoke.MARKER):
+            smoke.final_text(text, True, "gemma")
+        for text in (
+            "<|channel>analysis\nprivate<channel|>" + smoke.MARKER,
+            "<|channel>thought\nunfinished",
+            "<think>unfinished",
+            "<think>private</think><think>" + smoke.MARKER,
+            "<think broken</think>" + smoke.MARKER,
+            "<think>private<channel|>" + smoke.MARKER,
+            "<|channel>thought\n<|channel>analysis<channel|>" + smoke.MARKER,
+            "<|channel>thought\nprivate<channel|>" + smoke.MARKER + "<|channel",
+        ):
+            with self.subTest(text=text), self.assertRaises(RuntimeError):
+                smoke.final_text(text, False)
+
+    def test_model_type_and_template_must_agree(self):
+        for family, template, valid in (
+            ("qwen3_5", "enable_thinking <think> </think>", True),
+            ("gemma4", "enable_thinking <|channel>thought <channel|>", True),
+            ("lfm2_moe", "<think> </think>", True),
+            ("lfm2_moe", "enable_thinking <think> </think>", False),
+            ("gemma4", "enable_thinking <think> </think>", False),
+            ("unknown", "enable_thinking", False),
+        ):
+            with self.subTest(family=family, valid=valid), tempfile.TemporaryDirectory() as directory:
+                model = Path(directory)
+                (model / "config.json").write_text(json.dumps({"model_type": family}))
+                (model / "tokenizer.json").write_text("{}")
+                (model / "tokenizer_config.json").write_text(json.dumps({"chat_template": template}))
+                (model / "weights.safetensors").write_bytes(b"weights")
+                if valid:
+                    self.assertEqual(smoke.validate_model(str(model)), model)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        smoke.validate_model(str(model))
+
+    def test_native_lfm_default_omits_toggle_and_sampler_overrides(self):
+        caps = {
+            "model_family": "lfm2_moe",
+            "thinking_control": False,
+            "reasoning_format": "think",
+            "chat_template_kwargs": [],
+        }
+        result = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "<think>done</think>" + smoke.MARKER}}],
+            "usage": {"completion_tokens": 15},
+        }
+        with patch.object(smoke, "request", return_value=result) as request:
+            smoke.generate_chat(None, caps)
+            payload = request.call_args.args[1]
+            self.assertNotIn("chat_template_kwargs", payload)
+            self.assertNotIn("repetition_penalty", payload)
+            self.assertNotIn("top_p", payload)
+        with self.assertRaises(RuntimeError):
+            smoke.generate_chat(True, caps)
+
+    def test_native_controlled_profiles_forward_boolean_toggle(self):
+        for family, fmt in (("qwen3_5", "think"), ("gemma4", "gemma")):
+            caps = {
+                "model_family": family,
+                "thinking_control": True,
+                "reasoning_format": fmt,
+                "chat_template_kwargs": ["enable_thinking"],
+            }
+            for thinking in (False, True):
+                content = (
+                    ("private</think>" if fmt == "think" else "<|channel>thought\nprivate<channel|>") + smoke.MARKER
+                    if thinking
+                    else smoke.MARKER
+                )
+                result = {
+                    "choices": [{"finish_reason": "stop", "message": {"content": content}}],
+                    "usage": {"completion_tokens": 10},
+                }
+                with patch.object(smoke, "request", return_value=result) as request:
+                    self.assertEqual(smoke.generate_chat(thinking, caps), {"completion_tokens": 10})
+                    self.assertEqual(request.call_args.args[1]["chat_template_kwargs"], {"enable_thinking": thinking})
+
+    def test_sonnet_tool_bridge_rejects_wrong_marker_or_multiple_calls(self):
+        call = {"type": "tool_use", "name": "record_marker", "input": {"marker": smoke.MARKER}}
+        with patch.object(
+            smoke, "request", return_value={"stop_reason": "tool_use", "content": [call], "usage": {"input_tokens": 10}}
+        ):
+            self.assertEqual(smoke.generate_role("sonnet", tool=True), {"input_tokens": 10})
+        for content in ([dict(call, input={"marker": "WRONG"})], [call, call]):
+            with (
+                patch.object(smoke, "request", return_value={"stop_reason": "tool_use", "content": content}),
+                self.assertRaises(RuntimeError),
+            ):
+                smoke.generate_role("sonnet", tool=True)
+
+    def test_health_profiles_accept_legacy_qwen_and_coherent_native_families(self):
+        self.assertEqual(smoke.thinking_profiles({"chat_template_kwargs": ["enable_thinking"]}), (False, True))
+        for family, fmt, control, profiles in (
+            ("qwen3_5", "think", True, (False, True)),
+            ("gemma4", "gemma", True, (False, True)),
+            ("lfm2_moe", "think", False, (None,)),
+        ):
+            caps = {
+                "model_family": family,
+                "reasoning_format": fmt,
+                "thinking_control": control,
+                "chat_template_kwargs": ["enable_thinking"] if control else [],
+            }
+            self.assertEqual(smoke.thinking_profiles(caps), profiles)
+        for caps in (
+            {
+                "model_family": "lfm2_moe",
+                "reasoning_format": "think",
+                "thinking_control": True,
+                "chat_template_kwargs": ["enable_thinking"],
+            },
+            {
+                "model_family": "gemma4",
+                "reasoning_format": "think",
+                "thinking_control": True,
+                "chat_template_kwargs": ["enable_thinking"],
+            },
+            {},
+        ):
+            with self.assertRaises(RuntimeError):
+                smoke.thinking_profiles(caps)
 
 
 if __name__ == "__main__":
