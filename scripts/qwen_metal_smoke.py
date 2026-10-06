@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Real, offline Qwen generation on a trusted Apple Silicon CI host.
+"""Real, offline Qwen/Gemma4/LFM generation on a trusted Apple Silicon CI host.
 
 Also used by Sentinel: pass --gateway with its freshly built gateway binary.
 Only owned process groups are stopped; the interactive lab is never touched.
 """
+
 import argparse
-from contextlib import contextmanager
 import fcntl
 import json
 import os
-from pathlib import Path
 import platform
 import signal
 import socket
@@ -19,6 +18,8 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
 
 MARKER = "QWEN_ROLE_READY"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -73,8 +74,9 @@ def wait_ready(process, url, timeout=120):
 @contextmanager
 def owned_server(command, log, env):
     with open(log, "w") as stream:
-        process = subprocess.Popen(command, stdout=stream, stderr=stream,
-                                   stdin=subprocess.DEVNULL, env=env, start_new_session=True)
+        process = subprocess.Popen(
+            command, stdout=stream, stderr=stream, stdin=subprocess.DEVNULL, env=env, start_new_session=True
+        )
         try:
             yield process
         finally:
@@ -106,16 +108,38 @@ def validate_model(value):
     index = model / "model.safetensors.index.json"
     if index.exists():
         shards = set(json.loads(index.read_text()).get("weight_map", {}).values())
-        if not shards or any(Path(s).name != s or not (model / s).is_file()
-                             or not (model / s).stat().st_size for s in shards):
+        if not shards or any(
+            Path(s).name != s or not (model / s).is_file() or not (model / s).stat().st_size for s in shards
+        ):
             raise RuntimeError("Cached model index has missing/invalid shards")
     elif any("-of-" in file.name for file in weights):
         raise RuntimeError("Sharded model requires a weights index")
     template_file = model / "chat_template.jinja"
-    template = (template_file.read_text() if template_file.exists() else
-                json.loads((model / "tokenizer_config.json").read_text()).get("chat_template"))
-    if not isinstance(template, str) or "enable_thinking" not in template:
-        raise RuntimeError("Cached model must have a Qwen thinking template")
+    template = (
+        template_file.read_text()
+        if template_file.exists()
+        else json.loads((model / "tokenizer_config.json").read_text()).get("chat_template")
+    )
+    family = json.loads((model / "config.json").read_text()).get("model_type", "")
+    if not isinstance(template, str) or not template.strip():
+        raise RuntimeError("Cached model must have a native chat template")
+    controlled = "enable_thinking" in template
+    think = "<think>" in template and "</think>" in template
+    gemma = "<|channel>thought" in template and "<channel|>" in template
+    coherent = (
+        isinstance(family, str)
+        and family.startswith("qwen")
+        and controlled
+        and think
+        or family in ("gemma4", "gemma4_text")
+        and controlled
+        and gemma
+        or family == "lfm2_moe"
+        and not controlled
+        and think
+    )
+    if not coherent:
+        raise RuntimeError("Cached model type and native reasoning template are unsupported or inconsistent")
     return model
 
 
@@ -125,8 +149,11 @@ def preflight(executable, models):
     python = executable.parent / "python"
     if not executable.is_file() or not os.access(executable, os.X_OK) or not python.is_file():
         raise RuntimeError("QWEN_MLX_FLASH_BIN must name an installed venv executable")
-    check = subprocess.run([str(python), "-c", "import mlx.core as mx; assert mx.metal.is_available(), 'Metal unavailable'"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    check = subprocess.run(
+        [str(python), "-c", "import mlx.core as mx; assert mx.metal.is_available(), 'Metal unavailable'"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     if check.returncode:
         raise RuntimeError("Native runtime cannot initialize MLX Metal; real smoke failed preflight")
     for model in models:
@@ -152,44 +179,107 @@ def preflight_ports(ports):
             sock.close()
 
 
-def final_text(text, thinking):
-    if thinking:
-        if "</think>" not in text:
-            raise RuntimeError("Qwen thinking generation did not finish reasoning")
-        text = text.split("</think>", 1)[1]
-    elif "</think>" in text:
-        text = text.split("</think>", 1)[1]
+def thinking_profiles(capabilities):
+    """Validate advertised reasoning controls; legacy Qwen health stays supported."""
+    family = capabilities.get("model_family")
+    keys = capabilities.get("chat_template_kwargs", [])
+    if family is None and "thinking_control" not in capabilities and "reasoning_format" not in capabilities:
+        if "enable_thinking" in keys:
+            return (False, True)
+    controlled = capabilities.get("thinking_control")
+    fmt = capabilities.get("reasoning_format")
+    if family == "lfm2_moe" and controlled is False and fmt == "think" and keys == []:
+        return (None,)
+    expected = (
+        "gemma"
+        if family in ("gemma4", "gemma4_text")
+        else "think"
+        if isinstance(family, str) and family.startswith("qwen")
+        else None
+    )
+    if expected and controlled is True and fmt == expected and "enable_thinking" in keys:
+        return (False, True)
+    raise RuntimeError("Native runtime advertises unsupported or inconsistent reasoning capabilities")
+
+
+def final_text(text, thinking, reasoning_format=None):
+    marker = "</think>"
+    if "<|channel" in text or "<channel|" in text:
+        marker = "<channel|>"
+    if thinking and reasoning_format:
+        marker = "<channel|>" if reasoning_format == "gemma" else "</think>"
+    before, complete, after = text.partition(marker)
+    if complete:
+        opening = "<|channel>thought\n" if marker == "<channel|>" else "<think>"
+        reasoning = before.lstrip()
+        if reasoning.startswith(opening):
+            reasoning = reasoning[len(opening) :]
+        if any(token in reasoning for token in ("<think", "</think", "<|channel", "<channel|")):
+            raise RuntimeError("Native generation used partial or unexpected reasoning markers")
+        text = after
+    elif thinking:
+        raise RuntimeError("Native thinking generation did not finish reasoning")
+    if any(token in text for token in ("<think", "</think", "<|channel", "<channel|")):
+        raise RuntimeError("Native generation contained partial or unexpected reasoning markers")
     if text.strip() != MARKER:
-        raise RuntimeError("Qwen generation failed the exact final-answer marker")
+        raise RuntimeError("Native generation failed the exact final-answer marker")
 
 
-def generate_chat(thinking):
-    result = request("http://127.0.0.1:19191/v1/chat/completions", {
-        "model": "local", "messages": [{"role": "user", "content": f"Reply with exactly {MARKER} and no other final text."}],
-        "max_tokens": 8192 if thinking else 256, "temperature": 0,
-        "chat_template_kwargs": {"enable_thinking": thinking}, "stream": False})
+def generate_chat(thinking, capabilities=None):
+    capabilities = capabilities or {"chat_template_kwargs": ["enable_thinking"]}
+    if thinking not in thinking_profiles(capabilities):
+        raise RuntimeError("Native runtime does not support the requested thinking profile")
+    budget = 8192 if thinking is not False else 256
+    payload = {
+        "model": "local",
+        "messages": [{"role": "user", "content": f"Reply with exactly {MARKER} and no other final text."}],
+        "max_tokens": budget,
+        "temperature": 0,
+        "stream": False,
+    }
+    if thinking is not None:
+        payload["chat_template_kwargs"] = {"enable_thinking": thinking}
+    # Omit repetition_penalty: LFM's native runtime applies its 1.05 default.
+    result = request("http://127.0.0.1:19191/v1/chat/completions", payload)
     choice = result["choices"][0]
-    budget = 8192 if thinking else 256
     if choice.get("finish_reason") != "stop" or result.get("usage", {}).get("completion_tokens", budget) >= budget:
-        raise RuntimeError("Qwen chat generation was truncated or lacked token accounting")
-    final_text(choice["message"]["content"], thinking)
+        raise RuntimeError("Native chat generation was truncated or lacked token accounting")
+    final_text(choice["message"]["content"], thinking is True, capabilities.get("reasoning_format"))
     return result.get("usage", {})
 
 
 def generate_role(role, tool=False):
-    payload = {"model": "sentinel-" + role, "max_tokens": 8192 if role == "opus" else 512,
-               "messages": [{"role": "user", "content": f"Reply with exactly {MARKER} and no other final text."}]}
+    payload = {
+        "model": "sentinel-" + role,
+        "max_tokens": 8192 if role == "opus" else 512,
+        "messages": [{"role": "user", "content": f"Reply with exactly {MARKER} and no other final text."}],
+    }
     if tool:
         payload["messages"][0]["content"] = f"Call record_marker once with marker {MARKER}. Do not answer in text."
-        payload.update(tools=[{"name": "record_marker", "description": "Record a smoke-test marker; no side effects.",
-                              "input_schema": {"type": "object", "properties": {"marker": {"type": "string", "enum": [MARKER]}},
-                                               "required": ["marker"], "additionalProperties": False}}],
-                       tool_choice={"type": "tool", "name": "record_marker"})
+        payload.update(
+            tools=[
+                {
+                    "name": "record_marker",
+                    "description": "Record a smoke-test marker; no side effects.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"marker": {"type": "string", "enum": [MARKER]}},
+                        "required": ["marker"],
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+            tool_choice={"type": "tool", "name": "record_marker"},
+        )
     result = request("http://127.0.0.1:19190/v1/messages", payload)
     if tool:
         calls = [b for b in result.get("content", []) if b.get("type") == "tool_use"]
-        if (result.get("stop_reason") != "tool_use" or len(calls) != 1 or
-                calls[0].get("name") != "record_marker" or calls[0].get("input") != {"marker": MARKER}):
+        if (
+            result.get("stop_reason") != "tool_use"
+            or len(calls) != 1
+            or calls[0].get("name") != "record_marker"
+            or calls[0].get("input") != {"marker": MARKER}
+        ):
             raise RuntimeError("Sentinel tool bridge failed the validated marker call")
     else:
         if result.get("stop_reason") != "end_turn":
@@ -207,36 +297,80 @@ def run(args, results, raw):
     env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
     env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1")
     for name, model in models:
-        print(f"Starting owned {name} Qwen runtime on isolated CI ports.", flush=True)
-        command = [str(executable), "--model", str(model), "--host", "127.0.0.1", "--port", "19191",
-                   "--speculative", "none", "--request-timeout", "600"]
+        print(f"Starting owned {name} native runtime on isolated CI ports.", flush=True)
+        command = [
+            str(executable),
+            "--model",
+            str(model),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "19191",
+            "--speculative",
+            "none",
+            "--request-timeout",
+            "600",
+        ]
         with owned_server(command, raw / f"{name}-runtime.log", env) as process:
             health = wait_ready(process, "http://127.0.0.1:19191/health")
-            if "enable_thinking" not in health.get("capabilities", {}).get("chat_template_kwargs", []):
-                raise RuntimeError("Native runtime does not advertise Qwen thinking profiles")
-            results["health"].append({"model_size": name, "status": health["status"], "capabilities": health["capabilities"]})
+            profiles = thinking_profiles(health.get("capabilities", {}))
+            results["health"].append(
+                {"model_size": name, "status": health["status"], "capabilities": health["capabilities"]}
+            )
             if args.gateway:
                 upstream = "http://127.0.0.1:19191/v1"
                 # Only the model under test is loaded. Each tested role still goes
                 # through the real RoleRouter (including Opus's thinking profile).
-                gateway = [args.gateway, "--listen", "127.0.0.1:19190", "--upstream", upstream,
-                           "--role-haiku-upstream", upstream, "--role-sonnet-upstream", upstream,
-                           "--role-opus-upstream", upstream, "--claude-max-tokens", "8192", "--timeout", "10m"]
+                gateway = [
+                    args.gateway,
+                    "--listen",
+                    "127.0.0.1:19190",
+                    "--upstream",
+                    upstream,
+                    "--role-haiku-upstream",
+                    upstream,
+                    "--role-sonnet-upstream",
+                    upstream,
+                    "--role-opus-upstream",
+                    upstream,
+                    "--claude-max-tokens",
+                    "8192",
+                    "--timeout",
+                    "10m",
+                ]
                 with owned_server(gateway, raw / f"{name}-gateway.log", env) as gateway_process:
                     state = wait_ready(gateway_process, "http://127.0.0.1:19190/health")
                     if not state.get("capabilities", {}).get("claude_roles"):
                         raise RuntimeError("Gateway did not advertise all Claude roles")
-                    results["health"].append({"model_size": name, "scope": "gateway", "capabilities": state["capabilities"]})
-                    for role in (["haiku"] if name == "small" else ["sonnet", "opus"]):
+                    results["health"].append(
+                        {"model_size": name, "scope": "gateway", "capabilities": state["capabilities"]}
+                    )
+                    for role in ["haiku"] if name == "small" else ["sonnet", "opus"]:
                         print(f"Generating real Messages response: {role}.", flush=True)
-                        results["checks"].append({"role": role, "model_size": name, "usage": generate_role(role), "passed": True})
+                        results["checks"].append(
+                            {"role": role, "model_size": name, "usage": generate_role(role), "passed": True}
+                        )
                     if name == "large":
                         print("Generating validated Sonnet tool marker (no tool execution).", flush=True)
-                        results["checks"].append({"role": "sonnet", "tool_bridge": True, "usage": generate_role("sonnet", tool=True), "passed": True})
+                        results["checks"].append(
+                            {
+                                "role": "sonnet",
+                                "tool_bridge": True,
+                                "usage": generate_role("sonnet", tool=True),
+                                "passed": True,
+                            }
+                        )
             else:
-                for thinking in (False, True):
+                for thinking in profiles:
                     print(f"Generating real Chat Completions response: {name}, thinking={thinking}.", flush=True)
-                    results["checks"].append({"model_size": name, "thinking": thinking, "usage": generate_chat(thinking), "passed": True})
+                    results["checks"].append(
+                        {
+                            "model_size": name,
+                            "thinking": thinking,
+                            "usage": generate_chat(thinking, health["capabilities"]),
+                            "passed": True,
+                        }
+                    )
 
 
 def main():
@@ -247,8 +381,10 @@ def main():
     artifacts = Path(args.artifacts)
     artifacts.mkdir(parents=True, exist_ok=True)
     results = {"passed": False, "health": [], "checks": []}
+
     def interrupted(signum, frame):
         raise RuntimeError("Qwen smoke interrupted; cleaning up owned processes")
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, interrupted)
     try:
@@ -259,8 +395,15 @@ def main():
                     run(args, results, raw)
                     results["passed"] = True
                 finally:
-                    replacements = sorted({v for k, v in os.environ.items() if v and
-                                           (k.endswith("_PATH") or k in ("HOME", "QWEN_MLX_FLASH_BIN"))}, key=len, reverse=True)
+                    replacements = sorted(
+                        {
+                            v
+                            for k, v in os.environ.items()
+                            if v and (k.endswith("_PATH") or k in ("HOME", "QWEN_MLX_FLASH_BIN"))
+                        },
+                        key=len,
+                        reverse=True,
+                    )
                     replacements.append(directory)
                     for log in raw.glob("*.log"):
                         content = log.read_text(errors="replace")

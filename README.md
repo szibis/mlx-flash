@@ -807,3 +807,5 @@ See [docs/honest-benchmarks.md](docs/honest-benchmarks.md) for the full feature 
 ## License
 
 MIT
+
+See [native prompt reuse and local role profiles](docs/native-prompt-cache.md) for cache accounting, model compatibility and measured checks.

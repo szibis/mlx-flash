@@ -167,6 +167,7 @@ class TestChatRequestProfiles:
                 return messages[0]["content"] + (" THINK" if kwargs.get("enable_thinking") else " DIRECT")
 
         state = _make_state()
+        state.model = type("QwenModel", (), {"model_type": "qwen3"})()
         state.tokenizer = Tokenizer()
         state.generate = lambda messages, *args: {
             "output": state._format_messages(messages),
@@ -218,6 +219,7 @@ class TestChatRequestProfiles:
             assert current_chat_template_kwargs() == {"enable_thinking": True}
             raise RuntimeError("native generation failed")
 
+        state.model = type("QwenModel", (), {"model_type": "qwen3"})()
         state.generate = fail
         handler = self.handler(
             state,

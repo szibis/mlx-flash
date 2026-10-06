@@ -18,7 +18,14 @@ spec = importlib.util.spec_from_file_location(
 serve = importlib.util.module_from_spec(spec)
 with patch.dict(
     sys.modules,
-    {"mlx": MagicMock(), "mlx.core": MagicMock(), "mlx_lm": MagicMock(), "mlx_lm.sample_utils": MagicMock()},
+    {
+        "mlx": MagicMock(),
+        "mlx.core": MagicMock(),
+        "mlx_lm": MagicMock(),
+        "mlx_lm.sample_utils": MagicMock(),
+        "mlx_lm.models": MagicMock(),
+        "mlx_lm.models.cache": MagicMock(),
+    },
 ):
     spec.loader.exec_module(serve)
 batch_spec = importlib.util.spec_from_file_location(
@@ -33,7 +40,11 @@ def state():
     value = object.__new__(serve.InferenceState)
     value.model = object()
     value.tokenizer = MagicMock()
-    value.tokenizer.encode.return_value = [123]  # Deliberately unlike real generation count.
+    value.tokenizer.bos_token = None
+    value.tokenizer.encode.return_value = list(range(17))  # Input encoding, never output re-tokenization.
+    value.model_name = "fixture"
+    value.kv_bits = 0
+    value.prompt_reuse = serve.PromptReuse()
     value.spec_engine = None
     value.speculative = "none"
     value.batching = False
@@ -107,7 +118,7 @@ class GenerationMeasurementsTests(unittest.TestCase):
         self.assertEqual(result.get("generation_tps"), 10.0)
         self.assertEqual(value.total_tokens, 2)
         self.sampler.assert_called_once_with(temp=0.1, top_p=1.0, top_k=0)
-        value.tokenizer.encode.assert_not_called()
+        value.tokenizer.encode.assert_called_once_with("formatted prompt", add_special_tokens=True)
         self.assertEqual(value.last_generation["prompt_tokens"], 17)
         self.assertEqual(value.last_generation["generation_tokens"], 2)
         self.assertGreaterEqual(value.last_generation["ttft_ms"], 0)
