@@ -1,4 +1,4 @@
-name: Real Qwen Metal smoke
+name: Real MLX Metal integration
 
 on:
   workflow_call:
@@ -29,7 +29,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m unittest discover -s scripts -p test_qwen_metal_smoke.py -v
+      - run: python -m unittest discover -s scripts -p 'test_*.py' -v
 
   hardware-status:
     name: Hardware availability
@@ -47,7 +47,7 @@ jobs:
           fi
 
   qwen-metal:
-    name: Real Qwen native HTTP generation
+    name: Real MLX native API and cache proofs
     needs: harness
     if: vars.QWEN_METAL_ENABLED == 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     runs-on: [self-hosted, macOS, ARM64, qwen-metal]
@@ -61,6 +61,20 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || github.sha }}
           persist-credentials: false
+      - name: Select configured MLX integration model pair
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${MLX_SMALL_MODEL_PATH:-}" ] || [ -n "${MLX_LARGE_MODEL_PATH:-}" ]; then
+            : "${MLX_SMALL_MODEL_PATH:?Both MLX model paths are required}"
+            : "${MLX_LARGE_MODEL_PATH:?Both MLX model paths are required}"
+            {
+              printf 'QWEN_SMALL_MODEL_PATH=%s\n' "$MLX_SMALL_MODEL_PATH"
+              printf 'QWEN_LARGE_MODEL_PATH=%s\n' "$MLX_LARGE_MODEL_PATH"
+              printf 'QWEN_SMALL_MODEL_REVISION=%s\n' "${MLX_SMALL_MODEL_REVISION:-unknown}"
+              printf 'QWEN_LARGE_MODEL_REVISION=%s\n' "${MLX_LARGE_MODEL_REVISION:-unknown}"
+            } >> "$GITHUB_ENV"
+          fi
       - name: Install current checkout into isolated MLX runtime
         shell: bash
         run: |
@@ -74,9 +88,22 @@ jobs:
           "$VENV/bin/python" -m pip install setuptools wheel 'mlx==0.32.3' 'mlx-lm==0.32.0' 'transformers==5.18.0'
           "$VENV/bin/python" -m pip install --no-build-isolation -e .
           echo "QWEN_MLX_FLASH_BIN=$VENV/bin/mlx-flash" >> "$GITHUB_ENV"
-      - name: Run real offline HTTP smoke (small then large)
+      - name: Record immutable source and model revisions
         shell: bash
-        run: '"$QWEN_CI_PYTHON" scripts/qwen_metal_smoke.py'
+        run: |
+          mkdir -p qwen-metal-artifacts
+          python - <<'PY'
+          import json, os, pathlib, subprocess
+          revisions = {
+              "mlx_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "small_model_revision": os.environ.get("QWEN_SMALL_MODEL_REVISION", "unknown"),
+              "large_model_revision": os.environ.get("QWEN_LARGE_MODEL_REVISION", "unknown"),
+          }
+          pathlib.Path("qwen-metal-artifacts/revisions.json").write_text(json.dumps(revisions, indent=2) + "\n")
+          PY
+      - name: Run real offline HTTP/cache proofs (small then large)
+        shell: bash
+        run: '"$QWEN_CI_PYTHON" scripts/qwen_metal_smoke.py --integration-proofs'
       - name: Upload sanitized health, results, and server logs
         if: always()
         uses: actions/upload-artifact@v5

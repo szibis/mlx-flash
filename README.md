@@ -4,6 +4,9 @@
 
 <h1 align="center">MLX-Flash</h1>
 
+See [native API regression proofs](docs/integration-verification.md) for the
+cache/session/accounting/SSE contract gate, real Metal evidence and local commands.
+
 The Chat Completions server supports [request-scoped Qwen thinking profiles](docs/chat-profiles.md) through `chat_template_kwargs.enable_thinking`.
 
 For server token counts, sampling, EOS versus truncation, and buffered SSE, see
