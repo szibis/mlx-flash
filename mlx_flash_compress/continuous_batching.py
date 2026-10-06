@@ -65,6 +65,7 @@ class InferenceRequest:
     prompt_tokens: list[int]
     max_tokens: int = 256
     temperature: float = 0.0
+    finish_reason: Optional[str] = None
     status: RequestStatus = RequestStatus.QUEUED
     generated_tokens: list[int] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
@@ -607,9 +608,14 @@ class ContinuousBatchingEngine:
         self._total_tokens_generated += 1
 
         # Check stopping conditions
-        if len(req.generated_tokens) >= req.max_tokens:
+        eos = set(getattr(self.tokenizer, "eos_token_ids", []) or [])
+        if getattr(self.tokenizer, "eos_token_id", None) is not None:
+            eos.add(self.tokenizer.eos_token_id)
+        if next_token_id in eos:
+            req.finish_reason = "stop"
             self._finish_request(req)
-        elif hasattr(self.tokenizer, "eos_token_id") and next_token_id == self.tokenizer.eos_token_id:
+        elif len(req.generated_tokens) >= req.max_tokens:
+            req.finish_reason = "length"
             self._finish_request(req)
 
     def _padded_forward(

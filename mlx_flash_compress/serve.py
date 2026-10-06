@@ -21,6 +21,7 @@ Or from LM Studio: Add custom endpoint http://localhost:8080/v1
 import argparse
 import gc
 import json
+import math
 import os
 import pathlib
 import signal
@@ -35,7 +36,8 @@ from typing import Optional
 
 import mlx.core as mx
 import yaml
-from mlx_lm import generate, load
+from mlx_lm import generate, load, stream_generate
+from mlx_lm.sample_utils import make_sampler
 
 from mlx_flash_compress.chat_profiles import (
     ChatTemplateProfileError,
@@ -115,6 +117,7 @@ class InferenceState:
         # Stats
         self.total_requests = 0
         self.total_tokens = 0
+        self.last_generation = None
         self.start_time = time.monotonic()
 
     def load_model(self):
@@ -317,6 +320,7 @@ class InferenceState:
                 "requests": self.total_requests,
                 "tokens_generated": self.total_tokens,
                 "uptime_s": round(uptime, 0),
+                "last_generation": self.last_generation,
             },
             "optimization_hints": hints,
             "speculative_engine": self.speculative,
@@ -331,7 +335,9 @@ class InferenceState:
                 pass
         return status
 
-    def generate(self, messages: list[dict], max_tokens: int = 256, temperature: float = 0.7) -> dict:
+    def generate(
+        self, messages: list[dict], max_tokens: int = 256, temperature: float = 0.7, top_p: float = 1.0, top_k: int = 0
+    ) -> dict:
         """Generate a response with memory awareness."""
         if self.model is None:
             self.load_model()
@@ -370,31 +376,69 @@ class InferenceState:
         # Generate — use speculative engine if available
         t0 = time.monotonic()
         spec_stats = None
+        metrics = {}
         if self.spec_engine is not None:
+            if temperature != 0 or top_p != 1.0 or top_k != 0:
+                return {"error": "Speculative engines support only greedy temperature=0 without top_p/top_k filters"}
             prompt_tokens = mx.array(self.tokenizer.encode(prompt))
             result_tokens = self.spec_engine.generate(prompt_tokens, max_tokens=max_tokens)
             mx.synchronize()
             output = self.tokenizer.decode(result_tokens.tolist()[len(prompt_tokens) :])
+            generated = result_tokens.tolist()[len(prompt_tokens) :]
+            tokens = len(generated)
+            eos = set(getattr(self.tokenizer, "eos_token_ids", []) or [])
+            if getattr(self.tokenizer, "eos_token_id", None) is not None:
+                eos.add(self.tokenizer.eos_token_id)
+            finish = "stop" if any(token in eos for token in generated) else "length" if tokens >= max_tokens else None
+            metrics = {
+                "prompt_tokens": len(prompt_tokens),
+                "finish_reason": finish,
+                "generation_tps": None,
+                "prompt_tps": None,
+                "ttft_ms": None,
+                "peak_memory_gb": None,
+                "native_generation_metadata": False,
+                "usage_source": "exact_speculative_tokens",
+            }
             if hasattr(self.spec_engine, "get_stats"):
                 spec_stats = self.spec_engine.get_stats()
             elif hasattr(self.spec_engine, "get_stats_summary"):
                 spec_stats = self.spec_engine.get_stats_summary()
         else:
-            output = generate(
-                self.model,
-                self.tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                verbose=False,
-            )
+            sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
+            segments = []
+            last = None
+            ttft_ms = None
+            for response in stream_generate(
+                self.model, self.tokenizer, prompt=prompt, max_tokens=max_tokens, sampler=sampler
+            ):
+                if ttft_ms is None:
+                    ttft_ms = (time.monotonic() - t0) * 1000
+                segments.append(response.text)
+                last = response
+            if last is None or last.finish_reason not in ("stop", "length"):
+                raise RuntimeError("Native generator did not provide a completed response")
+            output = "".join(segments)
+            tokens = last.generation_tokens
+            metrics = {
+                "prompt_tokens": last.prompt_tokens,
+                "finish_reason": last.finish_reason,
+                "generation_tps": last.generation_tps,
+                "prompt_tps": last.prompt_tps,
+                "ttft_ms": ttft_ms,
+                "peak_memory_gb": last.peak_memory,
+                "native_generation_metadata": True,
+                "usage_source": "exact_mlx_lm_generation",
+            }
         mx.synchronize()
         elapsed = time.monotonic() - t0
 
-        tokens = len(self.tokenizer.encode(output))  # type: ignore[attr-defined]
         tps = tokens / elapsed if elapsed > 0 else 0
 
-        self.total_requests += 1
-        self.total_tokens += tokens
+        with self.chat_lock:
+            self.total_requests += 1
+            self.total_tokens += tokens
+            self.last_generation = {"generation_tokens": tokens, "time_s": elapsed, **metrics}
 
         log.info(
             "Inference complete",
@@ -425,6 +469,7 @@ class InferenceState:
             "time_s": round(elapsed, 2),
             "tok_per_s": round(tps, 1),
             "memory_pressure": mem_after.pressure_level,
+            **metrics,
         }
         if spec_stats is not None:
             result["speculative_stats"] = spec_stats
@@ -914,10 +959,48 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(error)}, 400)
 
     def _handle_chat_data(self, data, *, use_batch=False):
-
         messages = data.get("messages", [])
         max_tokens = data.get("max_tokens", 256)
         temperature = data.get("temperature", 0.7)
+        top_p = data.get("top_p", 1.0)
+        top_k = data.get("top_k", 0)
+        supported = {
+            "model",
+            "messages",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "stream",
+            "stream_options",
+            "chat_template_kwargs",
+        }
+        if set(data) - supported:
+            self._send_json({"error": "Unsupported request fields: " + ", ".join(sorted(set(data) - supported))}, 400)
+            return
+        if (
+            type(max_tokens) is not int
+            or max_tokens < 1
+            or type(top_k) is not int
+            or top_k < 0
+            or type(temperature) not in (int, float)
+            or not math.isfinite(temperature)
+            or temperature < 0
+            or type(top_p) not in (int, float)
+            or not math.isfinite(top_p)
+            or not 0 < top_p <= 1
+            or type(data.get("stream", False)) is not bool
+        ):
+            self._send_json({"error": "Invalid max_tokens, sampling or stream options"}, 400)
+            return
+        stream_options = data.get("stream_options", {})
+        if (
+            not isinstance(stream_options, dict)
+            or set(stream_options) - {"include_usage"}
+            or type(stream_options.get("include_usage", False)) is not bool
+        ):
+            self._send_json({"error": "Unsupported stream_options"}, 400)
+            return
 
         if not messages:
             self._send_json({"error": "No messages provided"}, 400)
@@ -925,20 +1008,42 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         stream = data.get("stream", False)
         state = self.server_state
+        if (
+            not use_batch
+            and (state.spec_engine is not None or state.speculative != "none")
+            and (temperature != 0 or top_p != 1.0 or top_k != 0)
+        ):
+            self._send_json(
+                {"error": "Speculative engines support only greedy temperature=0 without top_p/top_k filters"}, 400
+            )
+            return
 
         # Route through continuous batching engine when enabled
         if use_batch:
+            if top_p != 1.0 or top_k != 0:
+                self._send_json({"error": "Continuous batching does not support top_p/top_k filters"}, 400)
+                return
             if stream:
-                self._handle_stream_batched(messages, max_tokens, temperature)
+                self._handle_stream_batched(
+                    messages, max_tokens, temperature, include_usage=stream_options.get("include_usage", False)
+                )
             else:
                 self._handle_chat_batched(messages, max_tokens, temperature)
             return
 
         if stream:
-            self._handle_stream(messages, max_tokens, temperature)
+            self._handle_stream(
+                messages,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                include_usage=stream_options.get("include_usage", False),
+            )
             return
 
-        result = state.generate(messages, max_tokens, temperature)
+        sampling = {key: data[key] for key in ("top_p", "top_k") if key in data}
+        result = state.generate(messages, max_tokens, temperature, **sampling)
 
         if "error" in result:
             self._send_json({"error": result["error"]}, 503)
@@ -957,90 +1062,77 @@ class ChatHandler(BaseHTTPRequestHandler):
                         "role": "assistant",
                         "content": result["output"],
                     },
-                    "finish_reason": "stop",
+                    "finish_reason": result.get("finish_reason"),
                 }
             ],
             "usage": {
-                "prompt_tokens": 0,
+                "prompt_tokens": result.get("prompt_tokens"),
                 "completion_tokens": result["tokens"],
-                "total_tokens": result["tokens"],
+                "total_tokens": result["tokens"] + result["prompt_tokens"]
+                if result.get("prompt_tokens") is not None
+                else None,
             },
             "mlx_flash_compress": {
                 "tok_per_s": result["tok_per_s"],
                 "memory_pressure": result["memory_pressure"],
                 "speculative_engine": state.speculative,
+                "generation_tps": result.get("generation_tps"),
+                "prompt_tps": result.get("prompt_tps"),
+                "ttft_ms": result.get("ttft_ms"),
+                "peak_memory_gb": result.get("peak_memory_gb"),
+                "native_generation_metadata": result.get("native_generation_metadata", False),
+                "usage_source": result.get("usage_source", "unknown"),
             },
         }
         if "speculative_stats" in result:
             response["mlx_flash_compress"]["speculative_stats"] = result["speculative_stats"]
         self._send_json(response)
 
-    def _handle_stream(self, messages, max_tokens, temperature):
-        """Handle streaming (SSE) response — sends tokens as they generate."""
+    def _handle_stream(self, messages, max_tokens, temperature, top_p=1.0, top_k=0, *, include_usage=False):
+        """Send an explicitly buffered SSE response using the native result."""
         state = self.server_state
-        if state.model is None:
-            state.load_model()
-
-        prompt = state._format_messages(messages)
+        result = state.generate(messages, max_tokens, temperature, top_p=top_p, top_k=top_k)
+        if "error" in result:
+            self._send_json({"error": result["error"]}, 503)
+            return
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-
-        # Start SSE response
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("X-MLX-Generation", "buffered; chunks are not live model tokens")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-
-        t0 = time.monotonic()
-
-        # Generate full output (MLX doesn't easily support true token-by-token)
-        output = generate(
-            state.model,
-            state.tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            verbose=False,
-        )
-        mx.synchronize()
-
-        # Simulate streaming by sending words progressively
-        # This gives the SSE behavior clients expect
-        words = output.split(" ")
-        for i, word in enumerate(words):
-            chunk = word + (" " if i < len(words) - 1 else "")
-            event = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": "local",
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": chunk},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-            self.wfile.flush()
-
-        # Final chunk with finish_reason
+        event = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "local",
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": result["output"]}, "finish_reason": None}
+            ],
+        }
+        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
         final = {
             "id": chat_id,
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": "local",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": result.get("finish_reason")}],
+            "mlx_flash_compress": {
+                "native_generation_metadata": result.get("native_generation_metadata", False),
+                "usage_source": result.get("usage_source", "unknown"),
+            },
         }
+        if include_usage:
+            prompt_tokens = result.get("prompt_tokens")
+            final["usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": result["tokens"],
+                "total_tokens": prompt_tokens + result["tokens"] if prompt_tokens is not None else None,
+            }
         self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
-
-        elapsed = time.monotonic() - t0
-        tokens = len(state.tokenizer.encode(output))
-        state.total_requests += 1
-        state.total_tokens += tokens
 
     def _handle_chat_batched(self, messages, max_tokens, temperature):
         """Handle non-streaming chat via continuous batching engine."""
@@ -1066,8 +1158,21 @@ class ChatHandler(BaseHTTPRequestHandler):
         tokens = len(result.generated_tokens)
         tps = tokens / elapsed if elapsed > 0 else 0
 
-        state.total_requests += 1
-        state.total_tokens += tokens
+        with state.chat_lock:
+            state.total_requests += 1
+            state.total_tokens += tokens
+            state.last_generation = {
+                "prompt_tokens": len(req.prompt_tokens),
+                "generation_tokens": tokens,
+                "finish_reason": result.finish_reason,
+                "time_s": elapsed,
+                "ttft_ms": result.ttft_ms if result.first_token_at > 0 else None,
+                "generation_tps": result.tokens_per_second if result.first_token_at > 0 else None,
+                "prompt_tps": None,
+                "peak_memory_gb": None,
+                "native_generation_metadata": False,
+                "usage_source": "exact_batch_tokens",
+            }
 
         response = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -1081,7 +1186,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                         "role": "assistant",
                         "content": output,
                     },
-                    "finish_reason": "stop",
+                    "finish_reason": result.finish_reason,
                 }
             ],
             "usage": {
@@ -1092,11 +1197,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             "mlx_flash_compress": {
                 "tok_per_s": round(tps, 1),
                 "batched": True,
+                "native_generation_metadata": False,
+                "usage_source": "exact_batch_tokens",
             },
         }
         self._send_json(response)
 
-    def _handle_stream_batched(self, messages, max_tokens, temperature):
+    def _handle_stream_batched(self, messages, max_tokens, temperature, *, include_usage=False):
         """Handle streaming (SSE) response via continuous batching engine."""
         state = self.server_state
         if state.model is None:
@@ -1141,14 +1248,36 @@ class ChatHandler(BaseHTTPRequestHandler):
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": "local",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": req.finish_reason}],
+            "mlx_flash_compress": {"native_generation_metadata": False, "usage_source": "exact_batch_tokens"},
         }
+        if include_usage:
+            final["usage"] = {
+                "prompt_tokens": len(req.prompt_tokens),
+                "completion_tokens": len(req.generated_tokens),
+                "total_tokens": len(req.prompt_tokens) + len(req.generated_tokens),
+            }
         self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
+        from mlx_flash_compress.continuous_batching import RequestStatus
 
-        state.total_requests += 1
-        state.total_tokens += token_count
+        if req.status == RequestStatus.COMPLETED:
+            with state.chat_lock:
+                state.total_requests += 1
+                state.total_tokens += len(req.generated_tokens)
+                state.last_generation = {
+                    "prompt_tokens": len(req.prompt_tokens),
+                    "generation_tokens": len(req.generated_tokens),
+                    "finish_reason": req.finish_reason,
+                    "time_s": req.completed_at - req.created_at,
+                    "ttft_ms": req.ttft_ms if req.first_token_at > 0 else None,
+                    "generation_tps": req.tokens_per_second if req.first_token_at > 0 else None,
+                    "prompt_tps": None,
+                    "peak_memory_gb": None,
+                    "native_generation_metadata": False,
+                    "usage_source": "exact_batch_tokens",
+                }
 
     def _serve_chat_html(self):
         """Serve the web chat UI — loads from the shared HTML file."""
