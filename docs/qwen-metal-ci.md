@@ -20,7 +20,7 @@ Keep these machine-specific paths in the runner's environment, outside Git:
 | --- | --- |
 | `QWEN_CI_PYTHON` | Absolute Python executable in the cached native MLX environment |
 | `QWEN_SMALL_MODEL_PATH` | Absolute cached Qwen3.5 4B MLX 4-bit directory |
-| `QWEN_LARGE_MODEL_PATH` | Absolute cached Qwen3.6 35B A3B MLX 4-bit snapshot directory |
+| `QWEN_LARGE_MODEL_PATH` | Absolute cached Qwen3.8 27B MLX 4-bit directory, including its thinking template |
 | `QWEN_CI_LOCK_PATH` | Optional shared lock, default `/private/tmp/qwen-metal-ci.lock` |
 
 The job installs the **checked-out MLX-Flash source**, editable, into a temporary
@@ -28,6 +28,24 @@ venv derived from the cached runtime. Native package versions are pinned to
 MLX 0.32.3, mlx-lm 0.32.0, and transformers 5.18.0. Build tools can be downloaded;
 model downloading is disabled. `QWEN_MLX_FLASH_BIN` is set to this job's executable,
 so an old host installation cannot silently satisfy the current-source test.
+
+The lab and runner model store now select
+[`mlx-community/Qwen3.8-27B-4bit`](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit/tree/10c35caafbb80f7dc6a7a432cdd11af10a6d4818)
+at revision `10c35caafbb80f7dc6a7a432cdd11af10a6d4818`, with all three weight
+shards checked against Hub SHA-256 metadata. Include `chat_template.jinja` when
+preparing a cached directory. Existing `qwen3_5` support in mlx-lm 0.32.0 loads
+the language model for text-only generation; vision/video are not covered by
+this smoke. Small remains Qwen3.5-4B. Model paths stay host configuration rather
+than hard-coded workflow downloads.
+
+The interactive Sentinel lab passed all three exact role markers, completed
+thinking, required Claude tool schema output, and OpenAI Responses formatting
+with this artifact on 2026-10-06. This is local compatibility evidence, not a
+claim that the new artifact has already passed the entire CI hardware matrix.
+Thinking defaults to the model template's `xhigh` effort; the runtime currently
+accepts only `enable_thinking` as a template override. The dense 27B model may
+decode slower than the previous Qwen3.6 35B-A3B MoE. Quality and speed require
+representative task evaluation; do not copy old model benchmarks onto this one.
 
 Small and large models run sequentially to limit memory. Each receives real
 Chat Completions requests with thinking disabled and enabled. Both must return
