@@ -50,7 +50,7 @@ def highest_release(pages):
     return max(tags, key=latest_version, default="")
 
 
-def plan(prs, sha, version, latest):
+def plan(prs, sha, version, latest, prepare_missing=False, changelog="", tag_at_head=""):
     candidates = [
         pr
         for pr in prs
@@ -63,10 +63,45 @@ def plan(prs, sha, version, latest):
     pr = candidates[0]
     labels = {label["name"] for label in pr.get("labels", [])}
     bumps = [b for b in ("major", "minor", "patch") if f"release:{b}" in labels]
+    if any(
+        label.startswith("release:")
+        and label not in {"release:major", "release:minor", "release:patch", "release:automated"}
+        for label in labels
+    ):
+        raise ValueError("Unknown release label")
+    if not bumps and prepare_missing:
+        title = pr.get("title", "").lower()
+        if re.match(r"^[a-z]+(?:\([^)]*\))?!:", title):
+            bumps = ["major"]
+        elif re.match(r"^feat(?:\([^)]*\))?:", title):
+            bumps = ["minor"]
+        elif re.match(r"^(?:fix|perf|refactor)(?:\([^)]*\))?:", title):
+            bumps = ["patch"]
     if not bumps:
         return {"number": pr["number"], "bump": "none", "tag": ""}
     if len(bumps) != 1:
         raise ValueError("Use exactly one release label")
+    if prepare_missing:
+        if tag_at_head:
+            if tag_at_head != f"v{version}":
+                raise ValueError("Existing tag at tested commit must match package version")
+            if not re.search(r"^## \[" + re.escape(version) + r"\](?:\s|$)", changelog, re.M):
+                raise ValueError("Existing release tag is missing tracked release notes")
+            return {"number": pr["number"], "bump": bumps[0], "tag": tag_at_head, "prepare": ""}
+        target = version
+        if latest:
+            major, minor, patch = latest_version(latest)
+            requested = {
+                "major": f"{major + 1}.0.0",
+                "minor": f"{major}.{minor + 1}.0",
+                "patch": f"{major}.{minor}.{patch + 1}",
+            }[bumps[0]]
+            if version_tuple(version) < version_tuple(requested):
+                target = requested
+        has_notes = re.search(r"^## \[" + re.escape(target) + r"\](?:\s|$)", changelog, re.M)
+        if target != version or not has_notes:
+            return {"number": pr["number"], "bump": bumps[0], "tag": "", "prepare": target}
+        return {"number": pr["number"], "bump": bumps[0], "tag": f"v{version}", "prepare": ""}
     if version_tuple(version) <= latest_version(latest):
         raise ValueError("Release PR must pre-bump both package versions above the latest release")
     return {"number": pr["number"], "bump": bumps[0], "tag": f"v{version}"}
@@ -95,6 +130,8 @@ def main():
     parser.add_argument("--tag")
     parser.add_argument("--repository")
     parser.add_argument("--releases", type=Path)
+    parser.add_argument("--prepare-missing-version", action="store_true")
+    parser.add_argument("--tag-at-head", default="")
     args = parser.parse_args()
     try:
         if args.command == "latest":
@@ -102,7 +139,17 @@ def main():
             return
         version = package_version(args.root)
         if args.command == "plan":
-            outputs = plan(json.loads(args.prs.read_text()), args.sha, version, args.latest)
+            changelog_path = args.root / "CHANGELOG.md"
+            changelog = changelog_path.read_text() if changelog_path.exists() else ""
+            outputs = plan(
+                json.loads(args.prs.read_text()),
+                args.sha,
+                version,
+                args.latest,
+                args.prepare_missing_version,
+                changelog,
+                args.tag_at_head,
+            )
         else:
             outputs = verify(args.tag, version, args.latest, args.repository)
         for key, value in outputs.items():

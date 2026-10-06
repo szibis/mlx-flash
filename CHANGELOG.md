@@ -2,7 +2,22 @@
 
 All notable changes to MLX-Flash are documented here.
 
-## [Unreleased] — v0.6.0
+## [Unreleased]
+
+## [0.9.0] - 2026-10-06
+
+### Changes
+- Automatically prepare matching package versions and tracked release notes in a reviewable release PR after successful main CI; dispatch bot-PR checks explicitly and publish only after merge.
+- Use native generation accounting, sampling, and stop metadata (#19)
+- docs: document Qwen3.8 lab and Metal CI upgrade (#20)
+- feat: reuse bounded native prompt state and support Gemma/LFM checks (#21)
+
+Native prefix-cache measurements describe reused prefill work, not provider-billed monetary savings. Local SSE remains buffered; see [native cache details](docs/native-prompt-cache.md).
+
+## Historical unversioned notes
+
+The notes below were retained from the old `Unreleased — v0.6.0` heading.
+They do not identify a new release or establish current benchmark guarantees.
 
 ### Added
 - **Gemma 4 as default model** — chat auto-detects best Gemma 4 model (E2B/E4B/26B MoE/31B) for your hardware

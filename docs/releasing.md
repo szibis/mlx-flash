@@ -1,14 +1,33 @@
 # Releasing MLX-Flash
 
-Before merging a release PR, bump `version` in `pyproject.toml` and
-`__version__` in `mlx_flash_compress/__init__.py` to the same stable version
-(`major.minor.patch`) and add exactly one label: `release:major`,
-`release:minor`, or `release:patch`. The labels opt in to publishing; they
-do not modify package versions. Update the changelog in the PR.
+After successful current-main CI, Auto-Tag Release reads the exact merged PR.
+One `release:major`, `release:minor`, or `release:patch` label chooses the bump;
+otherwise conventional `feat!:` / `feat:` / `fix:` / `perf:` / `refactor:` titles
+choose major/minor/patch. Scoped conventional titles also work. Other changes
+skip publication. Conflicting or unknown bump labels fail explicitly.
+
+If the package version is already published, or its changelog section is missing,
+the workflow opens `release/prepare-v<version>` with matching `pyproject.toml`
+and runtime versions plus a dated `CHANGELOG.md` section. It includes commit
+subjects since the latest stable published release and promotes existing
+Unreleased notes, preserving older history. Review and merge this release PR;
+the workflow never merges it automatically or writes directly to main. Existing
+open preparation PRs are reused without force-pushing. Changes merged after a
+preparation PR was opened may require a subsequent release; review its notes and
+base before merging.
+
+The repository must allow GitHub Actions to create pull requests (Settings →
+Actions → General → Workflow permissions). The workflow requests Contents,
+Pull requests and Actions write permissions. A bot-created PR does not trigger
+ordinary PR checks, so CI, security and the model-free harness are dispatched
+explicitly on its branch. Dispatch runs cannot initiate publishing: publication
+still requires a successful push CI on current main. No PAT or branch-protection
+bypass is needed. See [GitHub's token-trigger rules](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
 
 After the complete `CI` workflow succeeds for the current `main` commit,
 Auto-Tag Release selects the merged PR whose merge SHA is that tested
-commit. Unlabelled PRs and stale CI runs skip publishing. It creates an
+commit. Stale CI runs skip publishing. When both package versions and the
+matching changelog section are ready, it creates an
 annotated tag and directly calls the reusable release workflow, because
 tags pushed with `GITHUB_TOKEN` do not trigger another workflow run.
 The release workflow rechecks package versions, tests the pinned tag,
@@ -46,7 +65,7 @@ installing its non-MLX test dependencies.
 Check publishing changes locally with:
 
 ```sh
-python -m pytest tests/test_release_metadata.py -q
+python -m pytest tests/test_release_metadata.py tests/test_prepare_release.py -q
 actionlint .github/workflows/auto-tag.yml .github/workflows/release.yml
 python -m build
 python -m twine check dist/*

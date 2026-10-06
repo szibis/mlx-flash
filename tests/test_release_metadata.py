@@ -135,3 +135,160 @@ def test_latest_uses_highest_stable_version_not_creation_order(tmp_path):
     result = run_metadata(tmp_path, "latest", "--releases", str(releases))
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "v0.10.0"
+
+
+@pytest.mark.parametrize("label,target", [("minor", "0.9.0"), ("patch", "0.8.1"), ("major", "1.0.0")])
+def test_automatic_plan_prepares_unbumped_package(tmp_path, label, target):
+    prs = tmp_path / "prs.json"
+    prs.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 21,
+                    "merged_at": "date",
+                    "merge_commit_sha": "tested",
+                    "base": {"ref": "main"},
+                    "labels": [{"name": "release:" + label}],
+                }
+            ]
+        )
+    )
+    result = run_metadata(
+        tmp_path, "plan", "--prs", str(prs), "--sha", "tested", "--latest", "v0.8.0", "--prepare-missing-version"
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"prepare={target}" in result.stdout.splitlines()
+    assert "tag=" in result.stdout.splitlines()
+
+
+def test_conventional_feature_title_requests_automatic_preparation(tmp_path):
+    prs = tmp_path / "prs.json"
+    prs.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 21,
+                    "title": "feat: native cache",
+                    "merged_at": "date",
+                    "merge_commit_sha": "tested",
+                    "base": {"ref": "main"},
+                    "labels": [],
+                }
+            ]
+        )
+    )
+    result = run_metadata(
+        tmp_path, "plan", "--prs", str(prs), "--sha", "tested", "--latest", "v0.8.0", "--prepare-missing-version"
+    )
+    assert result.returncode == 0, result.stderr
+    assert "prepare=0.9.0" in result.stdout.splitlines()
+
+
+def test_automatic_tag_requires_matching_changelog_section(tmp_path):
+    prs = tmp_path / "prs.json"
+    prs.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 22,
+                    "merged_at": "date",
+                    "merge_commit_sha": "tested",
+                    "base": {"ref": "main"},
+                    "labels": [{"name": "release:minor"}],
+                }
+            ]
+        )
+    )
+    package = tmp_path / "mlx_flash_compress"
+    package.mkdir()
+    (package / "__init__.py").write_text('__version__ = "0.9.0"\n')
+    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "0.9.0"\n')
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
+    args = (
+        "plan",
+        "--root",
+        str(tmp_path),
+        "--prs",
+        str(prs),
+        "--sha",
+        "tested",
+        "--latest",
+        "v0.8.0",
+        "--prepare-missing-version",
+    )
+    result = run_metadata(tmp_path, *args)
+    assert result.returncode == 0 and "prepare=0.9.0" in result.stdout.splitlines()
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n\n## [0.9.0] - 2026-10-06\n\n- Cache reuse.\n")
+    result = run_metadata(tmp_path, *args)
+    assert result.returncode == 0 and "tag=v0.9.0" in result.stdout.splitlines()
+
+
+def test_rerunning_already_published_commit_resumes_same_tag(tmp_path):
+    prs = tmp_path / "prs.json"
+    prs.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 21,
+                    "merged_at": "date",
+                    "merge_commit_sha": "tested",
+                    "base": {"ref": "main"},
+                    "labels": [{"name": "release:minor"}],
+                }
+            ]
+        )
+    )
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n\n## [0.8.0] - 2026-10-06\n\n- Changes.\n")
+    result = run_metadata(
+        tmp_path,
+        "plan",
+        "--prs",
+        str(prs),
+        "--sha",
+        "tested",
+        "--latest",
+        "v0.8.0",
+        "--prepare-missing-version",
+        "--tag-at-head",
+        "v0.8.0",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "tag=v0.8.0" in result.stdout.splitlines()
+    assert "prepare=" in result.stdout.splitlines()
+
+
+def test_prebumped_patch_cannot_satisfy_major_release_label(tmp_path):
+    prs = tmp_path / "prs.json"
+    prs.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 21,
+                    "merged_at": "date",
+                    "merge_commit_sha": "tested",
+                    "base": {"ref": "main"},
+                    "labels": [{"name": "release:major"}],
+                }
+            ]
+        )
+    )
+    package = tmp_path / "mlx_flash_compress"
+    package.mkdir()
+    (package / "__init__.py").write_text('__version__ = "0.8.1"\n')
+    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "0.8.1"\n')
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n\n## [0.8.1] - 2026-10-06\n\n- Change.\n")
+    result = run_metadata(
+        tmp_path,
+        "plan",
+        "--root",
+        str(tmp_path),
+        "--prs",
+        str(prs),
+        "--sha",
+        "tested",
+        "--latest",
+        "v0.8.0",
+        "--prepare-missing-version",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "tag=" in result.stdout.splitlines() and "prepare=1.0.0" in result.stdout.splitlines()

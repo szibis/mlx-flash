@@ -1,5 +1,6 @@
 name: Qwen smoke harness checks
 on:
+  workflow_dispatch:
   pull_request:
     branches: [main]
 permissions:
