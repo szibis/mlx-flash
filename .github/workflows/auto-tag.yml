@@ -1,6 +1,6 @@
 name: Auto-Tag Release
 
-# Release labels opt in; both package versions must be pre-bumped in the PR.
+# Successful main CI prepares a version/changelog PR, then publishes its merge.
 on:
   workflow_run:
     workflows: [CI]
@@ -10,7 +10,8 @@ on:
 permissions:
   contents: write
   packages: write
-  pull-requests: read
+  pull-requests: write
+  actions: write
 
 concurrency:
   group: release-publishing
@@ -51,7 +52,54 @@ jobs:
           # Listing succeeds even if the repository has no published releases.
           gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100" > /tmp/releases.json
           LATEST=$(python scripts/release_metadata.py latest --releases /tmp/releases.json)
-          python scripts/release_metadata.py plan --prs /tmp/release-prs.json --sha "$TESTED_SHA" --latest "$LATEST" >> "$GITHUB_OUTPUT"
+          TAG_AT_HEAD=$(git tag --points-at HEAD | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -1 || true)
+          python scripts/release_metadata.py plan --prs /tmp/release-prs.json --sha "$TESTED_SHA" --latest "$LATEST" --prepare-missing-version --tag-at-head "$TAG_AT_HEAD" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+      - name: Prepare version and tracked changelog pull request
+        if: steps.plan.outputs.prepare != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          VERSION: ${{ steps.plan.outputs.prepare }}
+          BUMP: ${{ steps.plan.outputs.bump }}
+          LATEST: ${{ steps.plan.outputs.latest }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA=$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$CURRENT_SHA" = "$TESTED_SHA" ] || { echo 'Main changed; skipping preparation.'; exit 0; }
+          BRANCH="release/prepare-v$VERSION"
+          EXISTING=$(gh pr list --repo "$REPOSITORY" --head "$BRANCH" --state open --json url --jq '.[0].url // ""')
+          if [ -z "$EXISTING" ]; then
+            # Never overwrite a previously prepared or manually closed branch.
+            if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+              echo "Existing $BRANCH has no open PR. Inspect it before retrying."; exit 1
+            fi
+            if [ -n "$LATEST" ]; then
+              git merge-base --is-ancestor "$LATEST" "$TESTED_SHA"
+              git log "$LATEST..HEAD" --format=%s --reverse > /tmp/release-changes.txt
+            else
+              git log --format=%s --reverse > /tmp/release-changes.txt
+            fi
+            python scripts/prepare_release.py --version "$VERSION" --date "$(date -u +%F)" --notes /tmp/release-changes.txt
+            git switch -c "$BRANCH"
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add pyproject.toml mlx_flash_compress/__init__.py CHANGELOG.md
+            git commit -m "chore: release v$VERSION"
+            git push origin "$BRANCH"
+            cat > /tmp/release-body.md <<'BODY'
+          Prepares the package/runtime version and tracked CHANGELOG from changes since the latest stable release. Review and merge this PR to publish after successful main CI and the real Metal release gate. No automatic merge or force-push occurs.
+
+          CI is dispatched explicitly because GitHub-token-created PRs do not trigger ordinary pull-request workflows. Optional PyPI/Homebrew publishing requires the configured credentials.
+          BODY
+            gh pr create --repo "$REPOSITORY" --head "$BRANCH" --base main --title "chore: release v$VERSION" --body-file /tmp/release-body.md --label "release:$BUMP"
+          else
+            echo "Reusing release PR: $EXISTING"
+          fi
+          gh workflow run test.yml --repo "$REPOSITORY" --ref "$BRANCH"
+          gh workflow run security.yml --repo "$REPOSITORY" --ref "$BRANCH"
+          gh workflow run qwen-harness.yml --repo "$REPOSITORY" --ref "$BRANCH"
       - name: Create tag, or resume an existing tag at the same tested commit
         id: tag
         if: steps.plan.outputs.tag != ''
