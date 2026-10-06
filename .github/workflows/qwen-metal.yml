@@ -92,7 +92,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p qwen-metal-artifacts
-          python - <<'PY'
+          "$QWEN_CI_PYTHON" - <<'PY'
           import json, os, pathlib, subprocess
           revisions = {
               "mlx_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
