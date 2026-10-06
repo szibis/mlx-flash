@@ -1,0 +1,92 @@
+name: Real Qwen Metal smoke
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Trusted source commit supplied by the calling CI/release workflow
+        type: string
+        required: false
+        default: ''
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen-metal-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  harness:
+    name: Model-free smoke harness tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s scripts -p test_qwen_metal_smoke.py -v
+
+  hardware-status:
+    name: Hardware availability
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report explicit hardware opt-in
+        env:
+          ENABLED: ${{ vars.QWEN_METAL_ENABLED }}
+          TRUSTED_REF: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          if [ "$ENABLED" = true ] && [ "$TRUSTED_REF" = true ]; then
+            echo 'Real Metal job enabled on trusted main/tag.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Real Metal job SKIPPED: QWEN_METAL_ENABLED must be true and ref must be main or a trusted tag. Hosted tests do not prove inference.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  qwen-metal:
+    name: Real Qwen native HTTP generation
+    needs: harness
+    if: vars.QWEN_METAL_ENABLED == 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    runs-on: [self-hosted, macOS, ARM64, qwen-metal]
+    timeout-minutes: 120
+    env:
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      QWEN_RUN_LARGE: 'true'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - name: Install current checkout into isolated MLX runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${QWEN_CI_PYTHON:?Runner must provide its cached Python runtime}"
+          : "${QWEN_SMALL_MODEL_PATH:?Runner must provide cached Qwen small model}"
+          : "${QWEN_LARGE_MODEL_PATH:?Runner must provide cached Qwen large model}"
+          VENV="$RUNNER_TEMP/qwen-mlx-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "QWEN_JOB_VENV=$VENV" >> "$GITHUB_ENV"
+          "$QWEN_CI_PYTHON" -m venv --system-site-packages "$VENV"
+          "$VENV/bin/python" -m pip install setuptools wheel 'mlx==0.32.3' 'mlx-lm==0.32.0' 'transformers==5.18.0'
+          "$VENV/bin/python" -m pip install --no-build-isolation -e .
+          echo "QWEN_MLX_FLASH_BIN=$VENV/bin/mlx-flash" >> "$GITHUB_ENV"
+      - name: Run real offline HTTP smoke (small then large)
+        shell: bash
+        run: '"$QWEN_CI_PYTHON" scripts/qwen_metal_smoke.py'
+      - name: Upload sanitized health, results, and server logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: qwen-metal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: qwen-metal-artifacts/
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Remove job runtime
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${QWEN_JOB_VENV:-}" ]; then rm -rf -- "$QWEN_JOB_VENV"; fi

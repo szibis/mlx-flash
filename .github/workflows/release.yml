@@ -2,13 +2,27 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g., v0.6.2)"
+        description: Existing release tag (e.g. v0.8.0); checkout and package must match
         required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      PYPI_TOKEN:
+        required: false
+      HOMEBREW_TAP_TOKEN:
+        required: false
+
+concurrency:
+  group: release-targets
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -18,164 +32,190 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  metadata:
+    name: Validate pinned release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.commit.outputs.sha }}
+      promote: ${{ steps.meta.outputs.promote }}
+      image: ${{ steps.meta.outputs.image }}
+      pypi: ${{ steps.targets.outputs.pypi }}
+      homebrew: ${{ steps.targets.outputs.homebrew }}
+    steps:
+      - name: Validate requested tag before checkout
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          TRUSTED_REF: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          [ "$TRUSTED_REF" = true ] || { echo 'Run publishing from main or a trusted tag so real inference is enforced'; exit 1; }
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Invalid stable release tag'; exit 1; }
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Validate package versions and determine promotion
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100" > /tmp/releases.json
+          LATEST=$(python scripts/release_metadata.py latest --releases /tmp/releases.json)
+          python scripts/release_metadata.py verify --tag "$TAG" --latest "$LATEST" --repository "$REPOSITORY" >> "$GITHUB_OUTPUT"
+          # Refuse release tags that have never been part of main.
+          git merge-base --is-ancestor HEAD origin/main
+      - name: Pin downstream jobs to the validated commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Detect optional publishing credentials
+        id: targets
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          for target in pypi homebrew; do
+            if { [ "$target" = pypi ] && [ -n "$PYPI_TOKEN" ]; } || { [ "$target" = homebrew ] && [ -n "$HOMEBREW_TAP_TOKEN" ]; }; then
+              echo "$target=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$target=false" >> "$GITHUB_OUTPUT"
+              echo "### $target skipped: optional publishing credential is not configured." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
   test:
-    name: Test before release
+    name: Test pinned release
+    needs: metadata
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: '3.13'
       - name: Install and test
         run: |
-          pip install numpy psutil tabulate pytest lz4 zstandard safetensors huggingface-hub
-          pip install mlx mlx-lm || true
+          python -m pip install '.[compression,dev]'
           python -m pytest tests/ -v --tb=short
-
-  pypi:
-    name: Publish to PyPI
-    needs: test
-    runs-on: macos-15
+  qwen-metal:
+    name: Qwen Metal release gate
+    needs: metadata
+    uses: ./.github/workflows/qwen-metal.yml
+    with:
+      source_ref: ${{ needs.metadata.outputs.sha }}
+    secrets: inherit
+  build:
+    name: Build distributions
+    needs: [metadata, test, qwen-metal]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - name: Build package
+          python-version: '3.13'
+      - name: Build and validate package
         run: |
-          pip install build twine
+          python -m pip install build twine pytest
           python -m build
-      - name: Upload to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: twine upload --skip-existing dist/*
-
+          python -m twine check dist/*
+          MLX_FLASH_DIST_DIR=dist python -m pytest tests/test_package_artifacts.py -q
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-distributions
+          path: dist/*
+          if-no-files-found: error
+  pypi:
+    name: Publish to PyPI (optional credential)
+    needs: [metadata, build]
+    if: needs.metadata.outputs.pypi == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+          skip-existing: true
   github-release:
-    name: Create GitHub Release
-    needs: test
+    name: Publish GitHub release and distributions
+    needs: [metadata, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
-          fetch-depth: 0
-      - name: Extract changelog for this version
-        id: changelog
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          # Extract section between this version header and next version header
-          NOTES=$(sed -n "/^## \[.*${VERSION}\]/,/^## \[/{ /^## \[.*${VERSION}\]/d; /^## \[/d; p; }" CHANGELOG.md)
-          if [ -z "$NOTES" ]; then
-            NOTES="See [CHANGELOG.md](CHANGELOG.md) for details."
-          fi
-          # Write to file for multiline support
-          echo "$NOTES" > /tmp/release_notes.md
-          echo "" >> /tmp/release_notes.md
-          echo "---" >> /tmp/release_notes.md
-          echo "" >> /tmp/release_notes.md
-          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$(git tag --sort=-creatordate | sed -n '2p')...v${VERSION}" >> /tmp/release_notes.md
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+          name: release-distributions
+          path: dist
+      - uses: softprops/action-gh-release@v2
         with:
-          body_path: /tmp/release_notes.md
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          target_commitish: ${{ needs.metadata.outputs.sha }}
           generate_release_notes: true
-          draft: false
-          prerelease: false
-
+          make_latest: ${{ needs.metadata.outputs.promote }}
+          files: dist/*
+          fail_on_unmatched_files: true
   docker:
-    name: Build and push Docker image
-    needs: test
+    name: Publish Linux testing image to GHCR
+    needs: [metadata, test, qwen-metal]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v5
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - name: Select image tags without downgrading latest
+        id: tags
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          PROMOTE: ${{ needs.metadata.outputs.promote }}
+        run: |
+          echo "tags=$IMAGE:$VERSION$([ "$PROMOTE" != true ] || printf ',%s:latest' "$IMAGE")" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/mlx-flash:${{ steps.version.outputs.VERSION }}
-            ghcr.io/${{ github.repository_owner }}/mlx-flash:latest
-
-  update-badges:
-    name: Update README badges
-    needs: [test, pypi, github-release]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: main
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Update badges in README
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-
-          # Count tests from test job (approximate from pyproject test count)
-          # Update test count badge
-          CURRENT_TESTS=$(grep -oP 'tests-\K[0-9]+' README.md | head -1 || echo "0")
-          echo "Current test badge: ${CURRENT_TESTS}"
-
-          # Update version in "What's New" if needed
-          echo "Badges are auto-updated via shields.io (PyPI, Release, Tests CI)"
-
-      - name: Commit badge updates if changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git diff --quiet && echo "No badge changes" && exit 0
-          git add README.md
-          git commit -m "chore: update badges for v${GITHUB_REF#refs/tags/v}"
-          git push origin main
-
+          tags: ${{ steps.tags.outputs.tags }}
   update-homebrew:
-    name: Update Homebrew tap
-    needs: [pypi, github-release]
+    name: Update Homebrew tap (optional credential)
+    needs: [metadata, github-release]
+    if: needs.metadata.outputs.homebrew == 'true' && needs.metadata.outputs.promote == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Update formula
+      - name: Update formula after GitHub archive is available
         env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          VERSION=${GITHUB_REF#refs/tags/v}
-
-          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
-            echo "::error::HOMEBREW_TAP_TOKEN secret is not set. Create a Fine-grained PAT with Contents:write on homebrew-mlx-flash repo."
-            exit 1
-          fi
-
-          SHA=$(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/v${VERSION}.tar.gz" | shasum -a 256 | cut -d' ' -f1)
-
-          REPO_URL="https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${{ github.repository_owner }}/homebrew-mlx-flash.git"
-          git clone "${REPO_URL}" /tmp/homebrew-tap
+          ARCHIVE="https://github.com/$REPOSITORY/archive/refs/tags/v$VERSION.tar.gz"
+          curl --fail --location --retry 3 "$ARCHIVE" -o /tmp/release.tar.gz
+          SHA=$(sha256sum /tmp/release.tar.gz | cut -d' ' -f1)
+          gh auth setup-git
+          git clone "https://github.com/$OWNER/homebrew-mlx-flash.git" /tmp/homebrew-tap
           cd /tmp/homebrew-tap
-
-          # Ensure push remote has token
-          git remote set-url origin "${REPO_URL}"
-
-          sed -i "s|url \".*\"|url \"https://github.com/${{ github.repository }}/archive/refs/tags/v${VERSION}.tar.gz\"|" Formula/mlx-flash.rb
-          sed -i "s|sha256 \".*\"|sha256 \"${SHA}\"|" Formula/mlx-flash.rb
-          echo "{\"version\": \"${VERSION}\"}" > version.json
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          sed -i "s|url \".*\"|url \"$ARCHIVE\"|" Formula/mlx-flash.rb
+          sed -i "s|sha256 \".*\"|sha256 \"$SHA\"|" Formula/mlx-flash.rb
+          printf '{"version": "%s"}\n' "$VERSION" > version.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add Formula/mlx-flash.rb version.json
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "Update mlx-flash to v${VERSION}"
+          git diff --cached --quiet && exit 0
+          git commit -m "Update mlx-flash to v$VERSION"
           git push origin main

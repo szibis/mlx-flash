@@ -19,6 +19,11 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  qwen-metal:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/qwen-metal.yml
+    with:
+      source_ref: ${{ github.sha }}
   # ---------------------------------------------------------------------------
   # Test matrix — Python 3.12 + 3.13 on macOS Apple Silicon
   # ---------------------------------------------------------------------------
@@ -111,7 +116,7 @@ jobs:
         run: |
           COUNT=$(python -m pytest tests/ --collect-only -q 2>/dev/null | tail -1 | grep -oE '^[0-9]+' || echo "0")
           echo "Collected tests: ${COUNT}"
-          echo "### Test Count: ${COUNT}" >> $GITHUB_STEP_SUMMARY
+          echo "### Test Count: ${COUNT}" >> "$GITHUB_STEP_SUMMARY"
           if [ "${COUNT}" -lt 1400 ]; then
             echo "::error::Test count ${COUNT} is below minimum threshold of 1400"
             exit 1
