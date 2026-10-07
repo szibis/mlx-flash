@@ -4,6 +4,11 @@ All notable changes to MLX-Flash are documented here.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-07
+
+### Changes
+- fix: coordinate hardware CI memory with the Sentinel lab (#26)
+
 ## [0.9.1] - 2026-10-06
 
 ### Changes
