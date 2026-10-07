@@ -2,7 +2,8 @@
 """Real, offline Qwen/Gemma4/LFM generation on a trusted Apple Silicon CI host.
 
 Also used by Sentinel: pass --gateway with its freshly built gateway binary.
-Only owned process groups are stopped; the interactive lab is never touched.
+Only owned processes are stopped. Explicitly configured idle labs can be paused
+and restored by Sentinel's Go coordination helper while holding the GPU lock.
 """
 
 import argparse
@@ -21,6 +22,7 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
+from lab_coordination import coordinate_lab
 from native_api_proofs import run_native_proofs
 
 MARKER = "QWEN_ROLE_READY"
@@ -400,7 +402,7 @@ def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, interrupted)
     try:
-        with machine_lock(os.environ.get("QWEN_CI_LOCK_PATH", "/private/tmp/qwen-metal-ci.lock")):
+        with machine_lock(os.environ.get("QWEN_CI_LOCK_PATH", "/private/tmp/qwen-metal-ci.lock")), coordinate_lab():
             with tempfile.TemporaryDirectory(prefix="qwen-ci-") as directory:
                 raw = Path(directory)
                 try:
@@ -423,6 +425,7 @@ def main():
                             content = content.replace(value, "<local-path>")
                         (artifacts / log.name).write_text(content)
     except Exception as error:
+        results["passed"] = False
         # Exception messages from libraries can contain local paths. Artifacts
         # retain check progress; failure details stay categorical.
         results["error"] = str(error) if type(error) is RuntimeError else type(error).__name__
