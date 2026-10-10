@@ -86,7 +86,7 @@ def test_http_cache_scope_reaches_generation_and_rejects_nonstring_scope():
     body = {"messages": [{"role": "user", "content": "hello"}], "cache_scope": "client-session"}
     handler = make_handler(state, body)
     ChatHandler._handle_chat_data(handler, body)
-    assert handler.results[-1][1] == {"error": "scope:client-session"}
+    assert handler.results[-1][1] == {"error": {"message": "scope:client-session", "type": "server_error"}}
     body["cache_scope"] = {"bad": "scope"}
     ChatHandler._handle_chat_data(handler, body)
     assert handler.results[-1][0] == 400
@@ -166,4 +166,4 @@ def test_http_repetition_penalty_is_validated_and_forwarded():
         serve.ChatHandler._handle_chat_data(handler, body)
         assert handler.results[-1][0] == status
         if status == 503:
-            assert handler.results[-1][1] == {"error": "penalty:1.05"}
+            assert handler.results[-1][1] == {"error": {"message": "penalty:1.05", "type": "server_error"}}

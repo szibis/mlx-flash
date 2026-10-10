@@ -45,8 +45,10 @@ def request(base_url: str, path: str, *, payload: dict | None = None, timeout: f
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
-    parser.add_argument("--timeout", type=float, default=180.0, help="per-request timeout; generation can be slow on first run")
-    parser.add_argument("--max-tokens", type=int, default=48)
+    parser.add_argument(
+        "--timeout", type=float, default=180.0, help="per-request timeout; generation can be slow on first run"
+    )
+    parser.add_argument("--max-tokens", type=int, default=192)
     args = parser.parse_args()
     if not 1 <= args.max_tokens <= 8192 or args.timeout <= 0:
         parser.error("--max-tokens must be 1..8192 and --timeout must be positive")
@@ -61,6 +63,12 @@ def main() -> int:
             verify(result)
         checks.append({"name": name, "status": "passed", "http_status": status, "elapsed_ms": elapsed})
         return result
+
+    def verify_text(text):
+        if not isinstance(text, str) or not text.strip():
+            raise CheckFailure("generation returned empty or non-text output")
+        if any(marker in text for marker in ("<|im_start|>", "<|im_end|>", "<|startoftext|>", "<|endoftext|>")):
+            raise CheckFailure("generation leaked chat control tokens")
 
     def verify_health(value):
         if value.get("status") != "ok" or value.get("model_loaded") is not True:
@@ -78,53 +86,152 @@ def main() -> int:
         if not models.get("data") or not isinstance(models["data"][0].get("id"), str):
             raise CheckFailure("models response has no model id")
 
-        chat = check("chat_completions", "/v1/chat/completions", payload={
-            "model": "local", "messages": [{"role": "user", "content": "Reply with one short greeting."}],
-            "max_tokens": args.max_tokens, "temperature": 0,
-        })
+        chat = check(
+            "chat_completions",
+            "/v1/chat/completions",
+            payload={
+                "model": "local",
+                "messages": [{"role": "user", "content": "Reply with one short greeting."}],
+                "max_tokens": args.max_tokens,
+                "temperature": 0,
+            },
+        )
         if not chat.get("choices") or not isinstance(chat["choices"][0].get("message", {}).get("content"), str):
             raise CheckFailure("chat completion response has no assistant text")
+        verify_text(chat["choices"][0]["message"]["content"])
 
-        completion = check("completions", "/v1/completions", payload={
-            "model": "local", "prompt": "Write one short greeting.", "max_tokens": args.max_tokens, "temperature": 0,
-        })
+        completion = check(
+            "completions",
+            "/v1/completions",
+            payload={
+                "model": "local",
+                "prompt": "Write one short greeting.",
+                "max_tokens": args.max_tokens,
+                "temperature": 0,
+            },
+        )
         if not completion.get("choices") or not isinstance(completion["choices"][0].get("text"), str):
             raise CheckFailure("completion response has no text")
+        verify_text(completion["choices"][0]["text"])
 
-        response = check("responses", "/v1/responses", payload={
-            "model": "local", "input": "Write one short greeting.", "max_output_tokens": args.max_tokens, "temperature": 0,
-        })
+        response = check(
+            "responses",
+            "/v1/responses",
+            payload={
+                "model": "local",
+                "input": "Write one short greeting.",
+                "max_output_tokens": args.max_tokens,
+                "temperature": 0,
+            },
+        )
         if response.get("status") != "completed" or not response.get("output"):
             raise CheckFailure("responses endpoint did not return a completed output")
+        verify_text(response["output"][0]["content"][0]["text"])
 
-        schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False}
-        structured = check("structured_output", "/v1/chat/completions", payload={
-            "model": "local", "messages": [{"role": "user", "content": 'Return exactly {"ok":true}.'}],
-            "max_tokens": args.max_tokens,
-            "response_format": {"type": "json_schema", "json_schema": {"name": "smoke_check", "strict": True, "schema": schema}},
-        })
+        schema = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": False,
+        }
+        structured = check(
+            "structured_output",
+            "/v1/chat/completions",
+            payload={
+                "model": "local",
+                "messages": [{"role": "user", "content": 'Return exactly {"ok":true}.'}],
+                "max_tokens": args.max_tokens,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "smoke_check", "strict": True, "schema": schema},
+                },
+            },
+        )
         try:
             structured_value = json.loads(structured["choices"][0]["message"]["content"])
         except (KeyError, TypeError, json.JSONDecodeError):
             raise CheckFailure("structured output was not valid JSON") from None
-        if not isinstance(structured_value, dict) or set(structured_value) != {"ok"} or not isinstance(structured_value["ok"], bool):
+        if structured_value != {"ok": True}:
             raise CheckFailure("structured output did not satisfy the smoke-test schema")
 
-        check("invalid_schema_rejected", "/v1/chat/completions", payload={
-            "messages": [{"role": "user", "content": "hello"}],
-            "response_format": {"type": "json_schema", "json_schema": {"name": "bad", "schema": {"type": "unknown"}}},
-        }, expected_status=400)
-        check("image_input_rejected", "/v1/chat/completions", payload={
-            "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}],
-        }, expected_status=400)
+        # Universal source fidelity check: valid JSON alone is insufficient.
+        expected = {"name": "Alex", "code": "X7", "quantity": 2, "note": None}
+        extraction_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "code": {"type": "string"},
+                "quantity": {"type": "integer"},
+                "note": {"type": ["string", "null"]},
+            },
+            "required": list(expected),
+            "additionalProperties": False,
+        }
+        extracted = check(
+            "source_fidelity_and_absent_values",
+            "/v1/chat/completions",
+            payload={
+                "model": "local",
+                "temperature": 0,
+                "max_tokens": args.max_tokens,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Extract name, code and quantity from: Alex requested 2 units of X7. No note was provided; use null for note. Do not invent information.",
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "source_record", "strict": True, "schema": extraction_schema},
+                },
+            },
+        )
+        if json.loads(extracted["choices"][0]["message"]["content"]) != expected:
+            raise CheckFailure("structured output did not preserve source facts and absent values")
 
-        report = {"result": "passed", "checked_at": datetime.now(timezone.utc).isoformat(), "base_url": args.base_url,
-                  "model": health.get("model"), "checks": checks}
+        check(
+            "invalid_schema_rejected",
+            "/v1/chat/completions",
+            payload={
+                "messages": [{"role": "user", "content": "hello"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "bad", "schema": {"type": "unknown"}},
+                },
+            },
+            expected_status=400,
+        )
+        check(
+            "image_input_rejected",
+            "/v1/chat/completions",
+            payload={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}],
+                    }
+                ],
+            },
+            expected_status=400,
+        )
+
+        report = {
+            "result": "passed",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "base_url": args.base_url,
+            "model": health.get("model"),
+            "checks": checks,
+        }
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     except (CheckFailure, OSError, TimeoutError, urllib.error.URLError) as error:
-        report = {"result": "failed", "checked_at": datetime.now(timezone.utc).isoformat(), "base_url": args.base_url,
-                  "checks": checks, "error": str(error)}
+        report = {
+            "result": "failed",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "base_url": args.base_url,
+            "checks": checks,
+            "error": str(error),
+        }
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 1
 

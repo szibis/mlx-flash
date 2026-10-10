@@ -4,7 +4,8 @@
 SHELL := /bin/bash
 BASE_PYTHON ?= $(shell command -v python3.13 || command -v python3.12 || command -v python3)
 PYTHON ?= .venv/bin/python
-MODEL ?= mlx-community/Qwen1.5-MoE-A2.7B-Chat-4bit
+BASE_PYTHON_VERSION := $(shell "$(BASE_PYTHON)" -c 'import sys; print(".".join(map(str, sys.version_info[:2])))' 2>/dev/null)
+MODEL ?= mlx-community/Qwen3-4B-Instruct-2507-4bit
 HOST ?= 127.0.0.1
 PORT ?= 8080
 
@@ -28,7 +29,13 @@ help:
 setup:
 	@python3 scripts/local_runtime.py check-host
 	@if [ ! -x "$(BASE_PYTHON)" ]; then echo "Nie znaleziono Python 3.12/3.13. Zainstaluj Python 3.13 i ponów próbę."; exit 1; fi
-	@if [ ! -x "$(PYTHON)" ]; then "$(BASE_PYTHON)" -m venv .venv; fi
+	@if [ ! -x "$(PYTHON)" ] || [ "$$($(PYTHON) -c 'import sys; print(".".join(map(str, sys.version_info[:2])))' 2>/dev/null)" != "$(BASE_PYTHON_VERSION)" ]; then \
+		echo "Przygotowuję środowisko dla Python $(BASE_PYTHON_VERSION)…"; \
+		rm -rf .venv; "$(BASE_PYTHON)" -m venv .venv || exit $$?; \
+	fi
+	@if ! "$(PYTHON)" -m pip --version >/dev/null 2>&1; then \
+		echo "Uzupełniam pip w lokalnym środowisku…"; "$(PYTHON)" -m ensurepip --upgrade || exit $$?; \
+	fi
 	@if [ ! -f .venv/.mlxflash-ready ]; then \
 		echo "Przygotowuję lokalny silnik MLX i wymagane pakiety…"; \
 		"$(PYTHON)" -m pip install --disable-pip-version-check -e '.[all]' || exit $$?; \

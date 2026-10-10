@@ -13,17 +13,17 @@
 
 1. Open the project folder in Finder.
 2. Double-click **Start pracownię.command**.
-3. On first launch, keep the Terminal window open while Python packages and the default model are prepared. The browser opens when the server is ready.
+3. On first launch, keep the Terminal window open while Python packages and the default model are prepared. The launcher reports when the API is ready; it does not open a browser.
 4. Later, double-click **Zatrzymaj pracownię.command** to stop the local server and monitoring services.
 
-The default model is a small 4-bit MoE suitable for starting on a 16 GB Mac. Its first download can take a while. Keep the project folder in place while the workbench is running. Logs are saved locally in `.local/runtime/server.log` and are not committed to Git.
+The default model is `mlx-community/Qwen3-4B-Instruct-2507-4bit`, a small dense text model. MoE models remain selectable with `MODEL=...`; choose a model only after verifying its output on your tasks. Memory needs depend on context length and other applications; a successful run on a larger Mac does not prove a 16 GB configuration. Its first download can take a while. Keep the project folder in place while the workbench is running. Logs are saved locally in `.local/runtime/server.log` and are not committed to Git.
 
 Docker Desktop must be installed and open. MLX itself runs as a native macOS process to use Metal; Compose starts the local Prometheus and Grafana monitoring services. The monitoring ports bind only to this Mac.
 
 ### One-command terminal use
 
 ```bash
-make up       # install once, start MLX + monitoring, open chat in browser
+make up       # install once, start MLX API + monitoring without opening a browser
 make status   # show whether the model is ready
 make verify   # send small real requests and verify API behavior
 make logs     # follow server logs

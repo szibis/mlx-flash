@@ -15,10 +15,27 @@ MAX_STRUCTURED_OUTPUT_BYTES = 256 * 1024
 MAX_JSON_DEPTH = 64
 _NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SCHEMA_KEYS = {
-    "$schema", "$id", "title", "description", "type", "properties", "required",
-    "additionalProperties", "items", "enum", "const", "anyOf", "minimum", "maximum",
-    "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "pattern",
-    "minItems", "maxItems",
+    "$schema",
+    "$id",
+    "title",
+    "description",
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "enum",
+    "const",
+    "anyOf",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "minItems",
+    "maxItems",
 }
 
 
@@ -83,7 +100,22 @@ def loads_json(raw: bytes | str) -> Any:
 
 
 def validate_chat_request(data: dict[str, Any]) -> None:
-    supported = {"model", "messages", "max_tokens", "max_completion_tokens", "temperature", "stream", "response_format", "chat_template_kwargs", "reasoning_effort", "top_p", "top_k", "stream_options", "cache_scope", "repetition_penalty"}
+    supported = {
+        "model",
+        "messages",
+        "max_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "stream",
+        "response_format",
+        "chat_template_kwargs",
+        "reasoning_effort",
+        "top_p",
+        "top_k",
+        "stream_options",
+        "cache_scope",
+        "repetition_penalty",
+    }
     unsupported = set(data) - supported
     if unsupported:
         raise APIRequestError("Unsupported chat completion fields: " + ", ".join(sorted(unsupported)[:5]))
@@ -101,7 +133,9 @@ def validate_chat_request(data: dict[str, Any]) -> None:
         if not isinstance(message.get("role"), str) or message["role"] not in allowed_roles:
             raise APIRequestError(f"messages[{index}].role is unsupported.")
         if not isinstance(message.get("content"), str):
-            raise APIRequestError("Image and non-text message content is not available in this server build.", code="unsupported_modality")
+            raise APIRequestError(
+                "Image and non-text message content is not available in this server build.", code="unsupported_modality"
+            )
         if "name" in message and (not isinstance(message["name"], str) or len(message["name"]) > 128):
             raise APIRequestError(f"messages[{index}].name must be a string of at most 128 characters.")
     max_tokens = data.get("max_completion_tokens", data.get("max_tokens", 256))
@@ -164,7 +198,10 @@ def _check_schema_bounds(value: Any, *, depth: int = 0, count: list[int] | None 
             raise APIRequestError("JSON Schema uses unsupported keywords: " + ", ".join(sorted(unknown)[:5]))
         if "type" in value:
             types = value["type"] if isinstance(value["type"], list) else [value["type"]]
-            if not types or any(not isinstance(t, str) or t not in {"object", "array", "string", "integer", "number", "boolean", "null"} for t in types):
+            if not types or any(
+                not isinstance(t, str) or t not in {"object", "array", "string", "integer", "number", "boolean", "null"}
+                for t in types
+            ):
                 raise APIRequestError("JSON Schema contains an unsupported type.")
         for key in ("title", "description"):
             if key in value and (not isinstance(value[key], str) or len(value[key]) > 4096):
@@ -178,7 +215,11 @@ def _check_schema_bounds(value: Any, *, depth: int = 0, count: list[int] | None 
                 _check_schema_bounds(child, depth=depth + 1, count=count)
         if "required" in value:
             required = value["required"]
-            if not isinstance(required, list) or any(not isinstance(k, str) for k in required) or len(set(required)) != len(required):
+            if (
+                not isinstance(required, list)
+                or any(not isinstance(k, str) for k in required)
+                or len(set(required)) != len(required)
+            ):
                 raise APIRequestError("JSON Schema required must be a unique array of strings.")
         if "additionalProperties" in value and not isinstance(value["additionalProperties"], bool):
             raise APIRequestError("Schema additionalProperties must be boolean.")
@@ -206,7 +247,10 @@ def _check_schema_bounds(value: Any, *, depth: int = 0, count: list[int] | None 
             if not isinstance(value["pattern"], str) or len(value["pattern"]) > 512:
                 raise APIRequestError("JSON Schema pattern must be a string of at most 512 characters.")
             repetitions = re.findall(r"(?<!\\)[*+?]|\{\d+(?:,\d*)?\}", value["pattern"])
-            if len(repetitions) > 8 or re.search(r"\\[1-9]|\(\?|\([^)]*\|[^)]*\)(?:[+*]|\{)|\([^)]*(?:[+*]|\{\d+(?:,\d*)?\})[^)]*\)(?:[+*]|\{)", value["pattern"]):
+            if len(repetitions) > 8 or re.search(
+                r"\\[1-9]|\(\?|\([^)]*\|[^)]*\)(?:[+*]|\{)|\([^)]*(?:[+*]|\{\d+(?:,\d*)?\})[^)]*\)(?:[+*]|\{)",
+                value["pattern"],
+            ):
                 raise APIRequestError("JSON Schema pattern uses a construct that could cause excessive matching time.")
             try:
                 re.compile(value["pattern"])
@@ -246,7 +290,9 @@ def parse_response_format(value: Any) -> ResponseFormat | None:
     schema = descriptor.get("schema")
     if not isinstance(name, str) or not _NAME.fullmatch(name):
         raise APIRequestError("json_schema.name must be 1–64 letters, digits, underscores, or hyphens.")
-    if "description" in descriptor and (not isinstance(descriptor["description"], str) or len(descriptor["description"]) > 4096):
+    if "description" in descriptor and (
+        not isinstance(descriptor["description"], str) or len(descriptor["description"]) > 4096
+    ):
         raise APIRequestError("json_schema.description must be text no longer than 4096 characters.")
     if not isinstance(strict, bool):
         raise APIRequestError("json_schema.strict must be a boolean.")
@@ -285,7 +331,9 @@ def _matches_type(value: Any, expected: str) -> bool:
 def _validate_value(value: Any, schema: dict[str, Any]) -> bool:
     """Validate the intentionally bounded JSON Schema subset supported by this API."""
     expected = schema.get("type")
-    if expected is not None and not any(_matches_type(value, item) for item in (expected if isinstance(expected, list) else [expected])):
+    if expected is not None and not any(
+        _matches_type(value, item) for item in (expected if isinstance(expected, list) else [expected])
+    ):
         return False
     if "enum" in schema and not any(type(value) is type(item) and value == item for item in schema["enum"]):
         return False
@@ -335,16 +383,65 @@ def _contains_non_finite(value: Any) -> bool:
     return False
 
 
+def _schema_diagnostics(value: Any, schema: dict[str, Any], path: str = "$", *, limit: int = 8) -> list[str]:
+    """Bounded format feedback for one retry. Never echo generated values/keys."""
+    if limit <= 0 or _validate_value(value, schema):
+        return []
+    expected = schema.get("type")
+    types = expected if isinstance(expected, list) else [expected]
+    if expected is not None and not any(_matches_type(value, item) for item in types):
+        return [f"{path}: wrong JSON type"]
+    if "anyOf" in schema and not any(_validate_value(value, choice) for choice in schema["anyOf"]):
+        for choice in schema["anyOf"]:
+            kinds = choice.get("type")
+            if kinds is None or any(
+                _matches_type(value, kind) for kind in (kinds if isinstance(kinds, list) else [kinds])
+            ):
+                return _schema_diagnostics(value, choice, path, limit=limit)
+        return [f"{path}: no anyOf alternative matches"]
+    errors = []
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        if any(key not in value for key in schema.get("required", [])):
+            errors.append(f"{path}: missing required properties")
+        if schema.get("additionalProperties") is False and any(key not in properties for key in value):
+            errors.append(f"{path}: additional properties are forbidden")
+        # Paths come only from the submitted schema, not unexpected model keys.
+        for key, child_schema in properties.items():
+            if key in value and len(errors) < limit:
+                child_path = path + "[" + json.dumps(key[:80], ensure_ascii=True) + "]"
+                errors.extend(_schema_diagnostics(value[key], child_schema, child_path, limit=limit - len(errors)))
+    elif isinstance(value, list) and "items" in schema:
+        for index, child in enumerate(value):
+            if len(errors) >= limit:
+                break
+            errors.extend(_schema_diagnostics(child, schema["items"], f"{path}[{index}]", limit=limit - len(errors)))
+    if not errors:
+        reason = (
+            "string pattern/length constraint failed"
+            if isinstance(value, str) and "pattern" in schema
+            else "schema constraint failed"
+        )
+        errors.append(f"{path}: {reason}")
+    return errors[:limit]
+
+
 def validate_structured_output(content: str, response_format: ResponseFormat) -> Any:
     """Parse a model response and fail closed unless it satisfies the requested format."""
     if not isinstance(content, str):
-        raise APIRequestError("The model returned a non-text structured response.", status=502, code="invalid_model_output")
+        raise APIRequestError(
+            "The model returned a non-text structured response.", status=502, code="invalid_model_output"
+        )
     try:
         content_bytes = content.encode("utf-8")
     except UnicodeEncodeError:
-        raise APIRequestError("The model response contained invalid Unicode.", status=502, code="invalid_model_output") from None
+        raise APIRequestError(
+            "The model response contained invalid Unicode.", status=502, code="invalid_model_output"
+        ) from None
     if len(content_bytes) > MAX_STRUCTURED_OUTPUT_BYTES:
-        raise APIRequestError("The model structured response exceeded the output limit.", status=502, code="invalid_model_output")
+        raise APIRequestError(
+            "The model structured response exceeded the output limit.", status=502, code="invalid_model_output"
+        )
     try:
         _check_json_depth(content)
         parsed = json.loads(
@@ -365,5 +462,10 @@ def validate_structured_output(content: str, response_format: ResponseFormat) ->
         except RecursionError:
             matches = False
         if not matches:
-            raise APIRequestError("The model response did not satisfy the requested JSON Schema.", status=502, code="invalid_model_output")
+            details = "; ".join(_schema_diagnostics(parsed, response_format.schema))[:2048]
+            raise APIRequestError(
+                "The model response did not satisfy the requested JSON Schema. " + details,
+                status=502,
+                code="invalid_model_output",
+            )
     return parsed

@@ -13,3 +13,9 @@ build/
 *.dylib
 benchmark_results.json
 /experts/
+.coverage
+.coverage.*
+.pytest_cache/
+coverage.xml
+test-results.xml
+contract-results.xml

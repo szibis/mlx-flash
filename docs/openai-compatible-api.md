@@ -24,6 +24,18 @@ python3 scripts/verify_openai_api.py --base-url http://127.0.0.1:8080 > openai-a
 
 It checks health/model readiness, advertised capabilities, chat/completions/responses generation, schema-validated JSON generation, and rejection of an invalid schema and image input. The JSON report includes each HTTP status and latency; a failed check exits non-zero and includes the failure reason. It sends several small prompts to the configured model, so run it when inference is idle. A passing report is evidence for that exact local runtime/model configuration, not a claim that unsupported vision or image editing works.
 
+The verifier also rejects leaked chat control tokens and checks source fidelity
+with a small generic record, including an absent value that must remain null.
+Correction receives the previous output as assistant context (at most 8192
+characters) plus bounded schema diagnostics. Diagnostics describe constraints,
+never generated values. The original instructions and sampling/cache options
+remain in effect; the one retry uses temperature zero and is validated again.
+
+`openai-contract.yml` runs model-free HTTP/schema/runtime regressions on Python
+3.12 and 3.13 and retains JUnit evidence. These tests include 250 seeded schema
+mutations. They do not prove real Metal inference; use the live verifier for
+that separately. Existing native/cache hardware CI remains independent.
+
 Example strict structured request:
 
 ```json

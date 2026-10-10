@@ -3,7 +3,14 @@
 import unittest
 from unittest.mock import patch
 
-from scripts.local_runtime import _config, managed_server_command, require_docker, require_supported_host, server_command
+from scripts import local_runtime
+from scripts.local_runtime import (
+    _config,
+    managed_server_command,
+    require_docker,
+    require_supported_host,
+    server_command,
+)
 
 
 class HostValidationTests(unittest.TestCase):
@@ -24,9 +31,16 @@ class NativeServerCommandTests(unittest.TestCase):
         self.assertEqual(
             server_command(".venv/bin/python", "mlx-community/tiny-model", "127.0.0.1", 8080),
             [
-                ".venv/bin/python", "-m", "mlx_flash_compress.serve",
-                "--model", "mlx-community/tiny-model", "--host", "127.0.0.1",
-                "--port", "8080", "--preload",
+                ".venv/bin/python",
+                "-m",
+                "mlx_flash_compress.serve",
+                "--model",
+                "mlx-community/tiny-model",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8080",
+                "--preload",
             ],
         )
 
@@ -39,7 +53,7 @@ class NativeServerCommandTests(unittest.TestCase):
     def test_server_configuration_is_local_by_default(self):
         with patch.dict("os.environ", {}, clear=True):
             model, host, port, timeout = _config()
-        self.assertEqual(model, "mlx-community/Qwen1.5-MoE-A2.7B-Chat-4bit")
+        self.assertEqual(model, "mlx-community/Qwen3-4B-Instruct-2507-4bit")
         self.assertEqual(host, "127.0.0.1")
         self.assertEqual(port, 8080)
         self.assertGreaterEqual(timeout, 30)
@@ -56,6 +70,17 @@ class DockerReadinessTests(unittest.TestCase):
         run.return_value.returncode = 1
         with self.assertRaisesRegex(RuntimeError, "Open Docker Desktop"):
             require_docker()
+
+
+class HeadlessStartupTests(unittest.TestCase):
+    def test_starting_an_existing_api_never_opens_a_browser(self):
+        with (
+            patch.object(local_runtime, "require_supported_host"),
+            patch.object(local_runtime, "_health", return_value={"status": "ok", "model_loaded": True}),
+            patch.object(local_runtime.subprocess, "run") as run,
+        ):
+            self.assertEqual(local_runtime.up(), 0)
+            run.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = ROOT / ".local" / "runtime"
 PID_FILE = STATE_DIR / "server.json"
 LOG_FILE = STATE_DIR / "server.log"
-DEFAULT_MODEL = "mlx-community/Qwen1.5-MoE-A2.7B-Chat-4bit"
+DEFAULT_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 
 
 def require_supported_host(system: str, machine: str) -> None:
@@ -30,15 +30,21 @@ def require_supported_host(system: str, machine: str) -> None:
             "run this launcher directly on the Mac, not inside a Linux container."
         )
     if machine not in {"arm64", "aarch64"}:
-        raise RuntimeError(
-            "This Python is running as Intel/Rosetta. Open Terminal without Rosetta and try again."
-        )
+        raise RuntimeError("This Python is running as Intel/Rosetta. Open Terminal without Rosetta and try again.")
 
 
 def server_command(python: str, model: str, host: str, port: int) -> list[str]:
     return [
-        python, "-m", "mlx_flash_compress.serve", "--model", model,
-        "--host", host, "--port", str(port), "--preload",
+        python,
+        "-m",
+        "mlx_flash_compress.serve",
+        "--model",
+        model,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--preload",
     ]
 
 
@@ -49,9 +55,9 @@ def managed_server_command(command: str, port: int) -> bool:
         return False
     return (
         "-m" in args
-        and args[args.index("-m") + 1:args.index("-m") + 2] == ["mlx_flash_compress.serve"]
+        and args[args.index("-m") + 1 : args.index("-m") + 2] == ["mlx_flash_compress.serve"]
         and "--port" in args
-        and args[args.index("--port") + 1:args.index("--port") + 2] == [str(port)]
+        and args[args.index("--port") + 1 : args.index("--port") + 2] == [str(port)]
     )
 
 
@@ -103,7 +109,9 @@ def _port_open(host: str, port: int) -> bool:
 def _process_command(pid: int) -> str | None:
     result = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "command="],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return result.stdout.strip() if result.returncode == 0 else None
 
@@ -129,12 +137,17 @@ def _managed_pid(record: dict, port: int) -> int | None:
 def _docker_compose(*args: str, required: bool = True) -> bool:
     try:
         result = subprocess.run(
-            ["docker", "compose", *args], cwd=ROOT, check=False,
-            capture_output=not required, text=True,
+            ["docker", "compose", *args],
+            cwd=ROOT,
+            check=False,
+            capture_output=not required,
+            text=True,
         )
     except FileNotFoundError:
         if required:
-            raise RuntimeError("Docker Desktop was not found. Install and open Docker Desktop, then try again.") from None
+            raise RuntimeError(
+                "Docker Desktop was not found. Install and open Docker Desktop, then try again."
+            ) from None
         return False
     if result.returncode and required:
         raise RuntimeError("Docker Compose could not start. Check Docker Desktop and try again.")
@@ -147,13 +160,18 @@ def require_docker() -> None:
     except FileNotFoundError:
         raise RuntimeError("Docker Desktop was not found. Install and open Docker Desktop, then try again.") from None
     if result.returncode:
-        raise RuntimeError("Docker Desktop is not ready. Open Docker Desktop, wait until it says Running, then try again.")
+        raise RuntimeError(
+            "Docker Desktop is not ready. Open Docker Desktop, wait until it says Running, then try again."
+        )
 
 
 def _probe_metal() -> None:
     probe = subprocess.run(
         [sys.executable, "-c", "import mlx.core as mx; print(mx.default_device())"],
-        cwd=ROOT, capture_output=True, text=True, check=False,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     output = (probe.stdout + probe.stderr).strip()
     if probe.returncode:
@@ -177,8 +195,7 @@ def up() -> int:
     if not _health(host, port) and _port_open(host, port):
         raise RuntimeError(f"Port {port} is already used by another program. Close it or choose MLX_FLASH_PORT.")
     if _health(host, port):
-        print(f"MLX-Flash is already running: http://{host}:{port}/chat")
-        subprocess.run(["open", f"http://{host}:{port}/chat"], check=False, capture_output=True)
+        print(f"MLX-Flash API is already running: http://{host}:{port}/v1")
         return 0
 
     _probe_metal()
@@ -190,12 +207,19 @@ def up() -> int:
     command = server_command(sys.executable, model, host, port)
     log_handle = LOG_FILE.open("ab", buffering=0)
     process = subprocess.Popen(
-        command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=log_handle,
-        stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
+        command,
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
     )
     log_handle.close()
     temporary = PID_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"pid": process.pid, "model": model, "host": host, "port": port}) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps({"pid": process.pid, "model": model, "host": host, "port": port}) + "\n", encoding="utf-8"
+    )
     temporary.replace(PID_FILE)
 
     print(f"Loading {model}. This can take a few minutes the first time…")
@@ -205,10 +229,9 @@ def up() -> int:
         while time.monotonic() < deadline:
             health = _health(host, port)
             if health and health.get("model_loaded") is True:
-                print(f"Ready: http://{host}:{port}/chat")
+                print(f"API ready: http://{host}:{port}/v1")
                 print(f"Admin: http://{host}:{port}/admin · Logs: {LOG_FILE.relative_to(ROOT)}")
                 print("Monitoring: http://localhost:3000 (Grafana) · http://localhost:9090 (Prometheus)")
-                subprocess.run(["open", f"http://{host}:{port}/chat"], check=False, capture_output=True)
                 return 0
             if _process_command(process.pid) is None:
                 raise RuntimeError("The server stopped while loading the model. Recent log:\n" + _tail_log())
