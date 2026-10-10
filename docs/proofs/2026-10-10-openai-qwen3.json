@@ -1,0 +1,72 @@
+{
+  "result": "passed",
+  "checked_at": "2026-10-10T20:50:44.153605+00:00",
+  "base_url": "http://127.0.0.1:8080",
+  "model": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+  "checks": [
+    {
+      "name": "health",
+      "status": "passed",
+      "http_status": 200,
+      "elapsed_ms": 37.4
+    },
+    {
+      "name": "capabilities",
+      "status": "passed",
+      "http_status": 200,
+      "elapsed_ms": 0.5,
+      "assertions": [
+        "chat completions advertised",
+        "vision reported unavailable"
+      ]
+    },
+    {
+      "name": "models",
+      "status": "passed",
+      "http_status": 200,
+      "elapsed_ms": 0.3
+    },
+    {
+      "name": "chat_completions",
+      "status": "passed",
+      "http_status": 200,
+      "elapsed_ms": 433.4
+    },
+    {
+      "name": "completions",
+      "status": "passed",
+      "http_status": 200,
+      "elapsed_ms": 200.9
+    },
+    {
+      "name": "responses",
+      "status": "passed",
+      "http_status": 200,
+      "elapsed_ms": 174.6
+    },
+    {
+      "name": "structured_output",
+      "status": "passed",
+      "http_status": 200,
+      "elapsed_ms": 363.2
+    },
+    {
+      "name": "source_fidelity_and_absent_values",
+      "status": "passed",
+      "http_status": 200,
+      "elapsed_ms": 639.1
+    },
+    {
+      "name": "invalid_schema_rejected",
+      "status": "passed",
+      "http_status": 400,
+      "elapsed_ms": 0.8
+    },
+    {
+      "name": "image_input_rejected",
+      "status": "passed",
+      "http_status": 400,
+      "elapsed_ms": 0.4
+    }
+  ]
+}

@@ -1,18 +1,18 @@
 # MLX-Flash Docker Compose
 #
-# NOTE: MLX inference requires native macOS + Apple Silicon (Metal GPU).
-# These containers are for: testing, building, CI/CD, and monitoring.
+# Inference runs natively on macOS so MLX can use Metal. `make up` starts
+# that server plus this Compose monitoring stack as one local workbench.
+# Tests and build tasks are also available as Compose services.
 #
 # Usage:
 #   docker compose run tests          # Python test suite
 #   docker compose run rust-build     # Compile Rust sidecar
 #   docker compose run e2e            # Full stack e2e tests
-#   docker compose up --build         # Build everything
+#   docker compose run --build tests  # Run the containerized test suite
 #
 #   docker compose up monitoring      # Prometheus + Grafana (scrapes native mlx-flash)
 #
-# For real inference, run natively:
-#   mlx-flash --port 8080 --workers 3
+# For the complete native + Docker runtime, use `make up`.
 
 services:
   # --- Python test suite (no MLX, tests logic only) ---
@@ -75,7 +75,7 @@ services:
   prometheus:
     image: prom/prometheus:latest
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./dashboards/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
@@ -87,7 +87,7 @@ services:
   grafana:
     image: grafana/grafana:latest
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=mlxflash
       - GF_SECURITY_ADMIN_USER=admin

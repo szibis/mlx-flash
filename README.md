@@ -89,7 +89,13 @@ brew install mlx-flash
 mlx-flash-chat
 ```
 
-### Option C: Docker (for CI/testing)
+### Option C: one-command Mac workbench
+
+On Apple Silicon, double-click `Start pracownię.command` or run `make up`. This prepares the local Python environment, starts MLX natively for Metal access, starts the Docker Compose monitoring stack, and reports API readiness without opening a browser. Run `make down` or double-click `Zatrzymaj pracownię.command` to stop everything.
+
+Docker is still used for the test/build services. The inference process stays native on macOS because the standard Docker Desktop Linux VM does not provide Metal to MLX.
+
+### Option D: Docker-only tests
 
 ```bash
 docker pull ghcr.io/szibis/mlx-flash:latest
@@ -573,6 +579,10 @@ MLX-Flash includes built-in web interfaces — no extra setup needed:
 | `http://localhost:8080/status` | **JSON status** — programmatic health check |
 
 The dashboard and chat UI also work on standalone Python workers (`:8081/admin`, `:8081/chat`).
+
+## OpenAI-compatible API
+
+The standalone server exposes `/v1/chat/completions`, the text-only `/v1/completions` and `/v1/responses` endpoints, `/v1/models`, and a capability inventory at `/v1/capabilities`. Chat supports SSE streaming; the compatibility endpoints currently accept non-streaming text requests. Structured JSON is validated before success. Vision, image editing, embeddings, and token-level grammar constraints are not advertised as available. See [docs/openai-compatible-api.md](docs/openai-compatible-api.md) for supported fields, limits, and error behavior.
 
 **Worker management** — control workers without restarting the server:
 

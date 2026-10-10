@@ -6,9 +6,16 @@ dist/
 build/
 .venv/
 .venv312/
+.local/
 *.egg
 .eggs/
 *.so
 *.dylib
 benchmark_results.json
 /experts/
+.coverage
+.coverage.*
+.pytest_cache/
+coverage.xml
+test-results.xml
+contract-results.xml
