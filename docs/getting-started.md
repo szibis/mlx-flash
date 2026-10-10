@@ -9,6 +9,32 @@
 
 ## Installation (2 minutes)
 
+### Easiest: double-click on Mac
+
+1. Open the project folder in Finder.
+2. Double-click **Start pracownię.command**.
+3. On first launch, keep the Terminal window open while Python packages and the default model are prepared. The browser opens when the server is ready.
+4. Later, double-click **Zatrzymaj pracownię.command** to stop the local server and monitoring services.
+
+The default model is a small 4-bit MoE suitable for starting on a 16 GB Mac. Its first download can take a while. Keep the project folder in place while the workbench is running. Logs are saved locally in `.local/runtime/server.log` and are not committed to Git.
+
+Docker Desktop must be installed and open. MLX itself runs as a native macOS process to use Metal; Compose starts the local Prometheus and Grafana monitoring services. The monitoring ports bind only to this Mac.
+
+### One-command terminal use
+
+```bash
+make up       # install once, start MLX + monitoring, open chat in browser
+make status   # show whether the model is ready
+make verify   # send small real requests and verify API behavior
+make logs     # follow server logs
+make down     # stop MLX and Docker services
+make test     # run the containerized test suite
+```
+
+Choose a different model at startup with `make up MODEL=mlx-community/<model-name>`.
+
+### Manual installation
+
 ```bash
 # Clone the repo
 git clone https://github.com/szibis/MLX-Flash.git
@@ -213,13 +239,16 @@ cargo build --release -p mlx-flash-server
   --socket-path /tmp/mlx-flash-cache.sock
 ```
 
-## Docker (for CI/testing only)
+## Docker Compose and MLX on Mac
 
 ```bash
-docker build -t mlx-flash .
-docker run mlx-flash
-# Runs synthetic benchmarks (MLX inference requires native macOS)
+make up
+make status
+make verify
+make down
 ```
+
+Docker Desktop on macOS cannot expose Metal to the Linux inference container. The `make` commands therefore coordinate two parts: the MLX server runs natively on Apple Silicon, and Docker Compose runs the local monitoring and test services. `make test-native` runs the full Python suite on the Mac; `make test-e2e` and `make test-rust` run their respective containerized suites.
 
 ## Troubleshooting
 

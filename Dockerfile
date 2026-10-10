@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml PYPI_README.md ./
 COPY mlx_flash_compress/ ./mlx_flash_compress/
 COPY tests/ ./tests/
-COPY scripts/release_metadata.py ./scripts/release_metadata.py
+COPY scripts/release_metadata.py scripts/local_runtime.py ./scripts/
 COPY docs/ ./docs/
 COPY assets/ ./assets/
 COPY README.md ./

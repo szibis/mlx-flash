@@ -89,7 +89,13 @@ brew install mlx-flash
 mlx-flash-chat
 ```
 
-### Option C: Docker (for CI/testing)
+### Option C: one-command Mac workbench
+
+On Apple Silicon, double-click `Start pracownię.command` or run `make up`. This prepares the local Python environment, starts MLX natively for Metal access, starts the Docker Compose monitoring stack, and opens the chat page. Run `make down` or double-click `Zatrzymaj pracownię.command` to stop everything.
+
+Docker is still used for the test/build services. The inference process stays native on macOS because the standard Docker Desktop Linux VM does not provide Metal to MLX.
+
+### Option D: Docker-only tests
 
 ```bash
 docker pull ghcr.io/szibis/mlx-flash:latest

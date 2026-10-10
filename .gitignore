@@ -6,6 +6,7 @@ dist/
 build/
 .venv/
 .venv312/
+.local/
 *.egg
 .eggs/
 *.so
