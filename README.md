@@ -574,6 +574,10 @@ MLX-Flash includes built-in web interfaces — no extra setup needed:
 
 The dashboard and chat UI also work on standalone Python workers (`:8081/admin`, `:8081/chat`).
 
+## OpenAI-compatible API
+
+The standalone server exposes `/v1/chat/completions`, the text-only `/v1/completions` and `/v1/responses` endpoints, `/v1/models`, and a capability inventory at `/v1/capabilities`. Chat supports SSE streaming; the compatibility endpoints currently accept non-streaming text requests. Structured JSON is validated before success. Vision, image editing, embeddings, and token-level grammar constraints are not advertised as available. See [docs/openai-compatible-api.md](docs/openai-compatible-api.md) for supported fields, limits, and error behavior.
+
 **Worker management** — control workers without restarting the server:
 
 | Action | API | Dashboard |
