@@ -140,6 +140,7 @@ def validate_chat_request(data: dict[str, Any], *, vision: bool = False) -> None
             raise APIRequestError(f"messages[{index}].name must be a string of at most 128 characters.")
     if vision:
         from mlx_flash_compress.vision_runtime import prepare_vision_messages
+
         prepare_vision_messages(messages)
     max_tokens = data.get("max_completion_tokens", data.get("max_tokens", 256))
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 1 <= max_tokens <= 8192:
@@ -182,11 +183,26 @@ def api_capabilities(*, vision: bool = False) -> dict[str, Any]:
             "output_limit_bytes": MAX_STRUCTURED_OUTPUT_BYTES,
             "streaming": False,
         },
-        "vision": ({"supported": True, "adapter": "mlx_vlm", "modalities": ["text", "image"],
-                    "input": ["image_url_data_url"], "formats": ["png", "jpeg"], "max_images": 1,
-                    "max_image_bytes": 4194304, "max_image_pixels": 4194304,
-                    "resident_between_requests": False, "concurrency": 1} if vision else
-                   {"supported": False, "reason": "text_generation_adapter_only_or_vision_not_loaded", "modalities": ["text"]}),
+        "vision": (
+            {
+                "supported": True,
+                "adapter": "mlx_vlm",
+                "modalities": ["text", "image"],
+                "input": ["image_url_data_url"],
+                "formats": ["png", "jpeg"],
+                "max_images": 1,
+                "max_image_bytes": 4194304,
+                "max_image_pixels": 4194304,
+                "resident_between_requests": False,
+                "concurrency": 1,
+            }
+            if vision
+            else {
+                "supported": False,
+                "reason": "text_generation_adapter_only_or_vision_not_loaded",
+                "modalities": ["text"],
+            }
+        ),
         "image_operations": {"supported": False, "reason": "no_native_image_operation_adapter", "operations": []},
     }
 

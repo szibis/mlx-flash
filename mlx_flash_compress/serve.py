@@ -118,6 +118,7 @@ class InferenceState:
         self.vision_runtime = None
         if vision:
             from mlx_flash_compress.vision_runtime import VisionRuntime
+
             self.vision_runtime = VisionRuntime(model_name)
         self.model = None
         self.tokenizer = None
@@ -145,8 +146,12 @@ class InferenceState:
 
     def capabilities(self):
         if getattr(self, "vision", False):
-            return {"model_family": self.vision_runtime.family, "thinking_control": False,
-                    "reasoning_format": "none", "chat_template_kwargs": []}
+            return {
+                "model_family": self.vision_runtime.family,
+                "thinking_control": False,
+                "reasoning_format": "none",
+                "chat_template_kwargs": [],
+            }
         family = getattr(self.model, "model_type", None)
         if not isinstance(family, str):
             try:
@@ -425,8 +430,9 @@ class InferenceState:
                 if get_memory_state().available_gb < self.mem_mgr.safety_margin_gb:
                     return {"error": "Insufficient memory headroom for vision generation."}
                 t0 = time.monotonic()
-                result = self.vision_runtime.generate(messages, max_tokens, temperature, top_p=top_p,
-                                                      top_k=top_k, repetition_penalty=repetition_penalty)
+                result = self.vision_runtime.generate(
+                    messages, max_tokens, temperature, top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty
+                )
                 result["time_s"] = round(time.monotonic() - t0, 2)
                 result["memory_pressure"] = get_memory_state().pressure_level
                 self.total_requests += 1
@@ -632,12 +638,16 @@ class ChatHandler(BaseHTTPRequestHandler):
                             "id": "local",
                             "object": "model",
                             "owned_by": "mlx-flash",
-                            "modalities": ["text", "image"] if getattr(getattr(self.server_state, "vision_runtime", None), "ready", False) else ["text"],
+                            "modalities": ["text", "image"]
+                            if getattr(getattr(self.server_state, "vision_runtime", None), "ready", False)
+                            else ["text"],
                             "model": getattr(self.server_state, "model_name", "local"),
                             "capabilities": {
                                 "chat_completions": True,
                                 "structured_outputs": True,
-                                "vision": bool(getattr(getattr(self.server_state, "vision_runtime", None), "ready", False)),
+                                "vision": bool(
+                                    getattr(getattr(self.server_state, "vision_runtime", None), "ready", False)
+                                ),
                                 "image_operations": False,
                             },
                         }
@@ -668,8 +678,11 @@ class ChatHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "model": state.model_name,
-                    "model_loaded": getattr(getattr(state, "vision_runtime", None), "model", None) is not None if getattr(state, "vision", False) else state.model is not None,
-                    "model_available": getattr(getattr(state, "vision_runtime", None), "ready", False) or state.model is not None,
+                    "model_loaded": getattr(getattr(state, "vision_runtime", None), "model", None) is not None
+                    if getattr(state, "vision", False)
+                    else state.model is not None,
+                    "model_available": getattr(getattr(state, "vision_runtime", None), "ready", False)
+                    or state.model is not None,
                     "runtime": "mlx_vlm" if getattr(state, "vision", False) else "mlx_lm",
                     "vision": getattr(state, "vision", False),
                     "unload_after_request": getattr(state, "vision", False),
@@ -710,13 +723,24 @@ class ChatHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if getattr(self.server_state, "vision", False) and self.path in (
-            "/v1/chat/completions", "/v1/completions", "/v1/responses"
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
         ):
             # Reject queued GPU work before reading/decompressing a large body.
             # The server owns this semaphore; no external runtime is controlled.
             if not self.server_state.vision_admission.acquire(blocking=False):
                 self.close_connection = True
-                self._send_json({"error": {"message": "Vision runtime is busy; retry after the current request.", "type": "server_error", "code": "runtime_busy"}}, 503)
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "Vision runtime is busy; retry after the current request.",
+                            "type": "server_error",
+                            "code": "runtime_busy",
+                        }
+                    },
+                    503,
+                )
                 return
             try:
                 self._dispatch_post()
@@ -727,7 +751,11 @@ class ChatHandler(BaseHTTPRequestHandler):
 
     def _dispatch_post(self):
         if getattr(self.server_state, "vision", False) and self.path not in (
-            "/v1/chat/completions", "/v1/completions", "/v1/responses", "/reload", "/shutdown"
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/reload",
+            "/shutdown",
         ):
             self._send_json({"error": "This native operation is unsupported with the vision runtime."}, 400)
             return
@@ -796,7 +824,9 @@ class ChatHandler(BaseHTTPRequestHandler):
             return b"".join(chunks)
         except TimeoutError:
             self.close_connection = True
-            raise APIRequestError("Request body upload deadline exceeded.", status=408, code="request_timeout") from None
+            raise APIRequestError(
+                "Request body upload deadline exceeded.", status=408, code="request_timeout"
+            ) from None
         finally:
             if connection is not None:
                 connection.settimeout(previous_timeout)
@@ -1310,7 +1340,9 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(error), "type": "invalid_request_error"}}, 400)
             return
         state = self.server_state
-        if getattr(state, "vision", False) and (data.get("stream", False) or "cache_scope" in data or options.get("enable_thinking", False)):
+        if getattr(state, "vision", False) and (
+            data.get("stream", False) or "cache_scope" in data or options.get("enable_thinking", False)
+        ):
             self._send_json({"error": "Vision does not support streaming, prompt reuse or thinking output."}, 400)
             return
         if getattr(state, "vision", False):
@@ -1345,11 +1377,29 @@ class ChatHandler(BaseHTTPRequestHandler):
         except ChatTemplateProfileError as error:
             self._send_json({"error": str(error)}, 400)
         except APIRequestError as error:
-            self._send_json({"error": {"message": str(error), "type": "server_error" if error.status >= 500 else "invalid_request_error", "code": error.code}}, error.status)
+            self._send_json(
+                {
+                    "error": {
+                        "message": str(error),
+                        "type": "server_error" if error.status >= 500 else "invalid_request_error",
+                        "code": error.code,
+                    }
+                },
+                error.status,
+            )
         except Exception:
             if not getattr(state, "vision", False):
                 raise
-            self._send_json({"error": {"message": "Vision runtime failed; owned model resources were released.", "type": "server_error", "code": "vision_runtime_error"}}, 503)
+            self._send_json(
+                {
+                    "error": {
+                        "message": "Vision runtime failed; owned model resources were released.",
+                        "type": "server_error",
+                        "code": "vision_runtime_error",
+                    }
+                },
+                503,
+            )
 
     def _handle_chat_data(self, data, *, use_batch=False):
         messages = data.get("messages", [])
@@ -2025,7 +2075,11 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--preload", action="store_true", help="Load model immediately")
-    parser.add_argument("--vision", action="store_true", help="Optional mlx-vlm image understanding; releases owned model after every request")
+    parser.add_argument(
+        "--vision",
+        action="store_true",
+        help="Optional mlx-vlm image understanding; releases owned model after every request",
+    )
     parser.add_argument(
         "--prompt-cache-bytes",
         type=int,
@@ -2075,7 +2129,9 @@ def main():
     )
     args = parser.parse_args()
     if args.vision and (not args.model or args.batching or args.speculative != "none" or args.kv_bits):
-        parser.error("--vision requires an explicit vision model and disables batching, speculation and KV quantization")
+        parser.error(
+            "--vision requires an explicit vision model and disables batching, speculation and KV quantization"
+        )
 
     # Initialize structured logging
     global logger

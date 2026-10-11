@@ -53,7 +53,14 @@ else: sys.exit(2)
             env = dict(os.environ)
             env.pop("MAKEFLAGS", None)
             result = subprocess.run(
-                ["make", "-f", str(ROOT / "Makefile"), "setup", f"BASE_PYTHON={root / 'base-python'}", f"VISION={vision}"],
+                [
+                    "make",
+                    "-f",
+                    str(ROOT / "Makefile"),
+                    "setup",
+                    f"BASE_PYTHON={root / 'base-python'}",
+                    f"VISION={vision}",
+                ],
                 cwd=root,
                 env=env,
                 capture_output=True,

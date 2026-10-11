@@ -1,4 +1,5 @@
 """Optional, bounded mlx-vlm image-understanding adapter (no image editing)."""
+
 from __future__ import annotations
 
 import base64
@@ -18,7 +19,11 @@ _CONTROL = re.compile(r"<\|[^>]*>|<[^>]*\|>|</?think>|<(?:start_of_turn|end_of_t
 
 
 def decode_image_url(value):
-    if not isinstance(value, dict) or set(value) - {"url", "detail"} or value.get("detail", "auto") not in ("auto", "low", "high"):
+    if (
+        not isinstance(value, dict)
+        or set(value) - {"url", "detail"}
+        or value.get("detail", "auto") not in ("auto", "low", "high")
+    ):
         raise APIRequestError("image_url accepts url and detail=auto/low/high only.")
     url = value.get("url")
     if not isinstance(url, str) or len(url) > (MAX_IMAGE_BYTES + 2) // 3 * 4 + 64:
@@ -27,6 +32,7 @@ def decode_image_url(value):
     if not match:
         raise APIRequestError("Only base64 PNG/JPEG data URLs are supported; remote and local URLs are disabled.")
     from PIL import Image
+
     try:
         raw = base64.b64decode(match[2], validate=True)
         if not raw or len(raw) > MAX_IMAGE_BYTES:
@@ -35,12 +41,18 @@ def decode_image_url(value):
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(raw)) as source:
                 expected = "PNG" if match[1] == "png" else "JPEG"
-                if source.format != expected or source.width * source.height > MAX_IMAGE_PIXELS or getattr(source, "n_frames", 1) != 1:
+                if (
+                    source.format != expected
+                    or source.width * source.height > MAX_IMAGE_PIXELS
+                    or getattr(source, "n_frames", 1) != 1
+                ):
                     raise ValueError("image format, dimensions or frame count")
                 source.load()
                 return source.convert("RGB")
     except (ValueError, OSError, binascii.Error, Image.DecompressionBombWarning, Image.DecompressionBombError):
-        raise APIRequestError("Image must be a valid single-frame PNG/JPEG of at most 4 MiB and 4 megapixels.") from None
+        raise APIRequestError(
+            "Image must be a valid single-frame PNG/JPEG of at most 4 MiB and 4 megapixels."
+        ) from None
 
 
 def prepare_vision_messages(messages):
@@ -74,11 +86,14 @@ def prepare_vision_messages(messages):
 
 def validate_vision_output(output):
     if not isinstance(output, str) or not output.strip() or _CONTROL.search(output):
-        raise APIRequestError("Vision model returned empty content or unresolved control tokens.", status=502, code="invalid_model_output")
+        raise APIRequestError(
+            "Vision model returned empty content or unresolved control tokens.", status=502, code="invalid_model_output"
+        )
 
 
 class VisionRuntime:
     """One resident model at a time; owned resources released after every call."""
+
     def __init__(self, model_name):
         self.model_name = model_name
         self.model = self.processor = None
@@ -108,6 +123,7 @@ class VisionRuntime:
         self.model = self.processor = None
         gc.collect()
         import mlx.core as mx
+
         mx.synchronize()
         mx.clear_cache()
 
@@ -117,16 +133,36 @@ class VisionRuntime:
             self.load()
             from mlx_vlm import generate
             from mlx_vlm.prompt_utils import apply_chat_template
-            prompt = apply_chat_template(self.processor, self.model.config, normalized, num_images=len(images), enable_thinking=False)
-            result = generate(self.model, self.processor, prompt=prompt, image=images or None, max_tokens=max_tokens,
-                              temperature=temperature, verbose=False, enable_thinking=False, **sampling)
+
+            prompt = apply_chat_template(
+                self.processor, self.model.config, normalized, num_images=len(images), enable_thinking=False
+            )
+            result = generate(
+                self.model,
+                self.processor,
+                prompt=prompt,
+                image=images or None,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                verbose=False,
+                enable_thinking=False,
+                **sampling,
+            )
             validate_vision_output(result.text)
             if result.finish_reason not in ("stop", "length"):
                 raise APIRequestError("Vision generator did not complete.", status=502, code="invalid_model_output")
-            return {"output": result.text, "tokens": result.generation_tokens, "prompt_tokens": result.prompt_tokens,
-                    "finish_reason": result.finish_reason, "tok_per_s": result.generation_tps,
-                    "generation_tps": result.generation_tps, "prompt_tps": result.prompt_tps,
-                    "peak_memory_gb": result.peak_memory, "native_generation_metadata": True,
-                    "usage_source": "exact_mlx_vlm_generation", "memory_pressure": "normal"}
+            return {
+                "output": result.text,
+                "tokens": result.generation_tokens,
+                "prompt_tokens": result.prompt_tokens,
+                "finish_reason": result.finish_reason,
+                "tok_per_s": result.generation_tps,
+                "generation_tps": result.generation_tps,
+                "prompt_tps": result.prompt_tps,
+                "peak_memory_gb": result.peak_memory,
+                "native_generation_metadata": True,
+                "usage_source": "exact_mlx_vlm_generation",
+                "memory_pressure": "normal",
+            }
         finally:
             self.release()

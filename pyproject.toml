@@ -40,6 +40,7 @@ compression = [
     "zstandard>=0.23.0",
 ]
 dev = [
+    "Pillow>=10.0",
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "pytest-benchmark>=4.0",

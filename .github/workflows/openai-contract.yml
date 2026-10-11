@@ -26,11 +26,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install model-free contract dependencies
-        run: python -m pip install pytest numpy psutil tabulate pyyaml
+        run: python -m pip install pytest numpy psutil tabulate pyyaml Pillow
       - name: HTTP, schema, malformed input, retry, cache and setup regression
         run: >-
           python -m pytest
           tests/test_openai_compat.py tests/test_serve_openai_compat.py
+          tests/test_vision_runtime.py tests/test_serve_vision.py
           tests/test_generation_measurements.py tests/test_serve_prompt_reuse.py
           tests/test_local_runtime.py tests/test_make_setup.py tests/test_verify_openai_api.py
           -v --junitxml=contract-results.xml

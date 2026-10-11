@@ -1,7 +1,7 @@
 """Tests for the one-command native MLX + Docker runtime launcher."""
 
-import unittest
 import io
+import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
@@ -88,7 +88,9 @@ class HeadlessStartupTests(unittest.TestCase):
     def test_vision_status_accepts_verified_nonresident_model(self):
         output = io.StringIO()
         with (
-            patch.object(local_runtime, "_health", return_value={"status": "ok", "model_available": True, "model_loaded": False}),
+            patch.object(
+                local_runtime, "_health", return_value={"status": "ok", "model_available": True, "model_loaded": False}
+            ),
             patch.object(local_runtime, "_docker_compose"),
             redirect_stdout(output),
         ):
