@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(shutil.which("make"), "make is required")
 class SetupRecoveryTests(unittest.TestCase):
-    def run_setup(self, version, has_pip):
+    def run_setup(self, version, has_pip, vision="0"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -53,7 +53,7 @@ else: sys.exit(2)
             env = dict(os.environ)
             env.pop("MAKEFLAGS", None)
             result = subprocess.run(
-                ["make", "-f", str(ROOT / "Makefile"), "setup", f"BASE_PYTHON={root / 'base-python'}"],
+                ["make", "-f", str(ROOT / "Makefile"), "setup", f"BASE_PYTHON={root / 'base-python'}", f"VISION={vision}"],
                 cwd=root,
                 env=env,
                 capture_output=True,
@@ -79,3 +79,7 @@ else: sys.exit(2)
         self.assertNotIn("'venv'", calls)
         self.assertNotIn("'ensurepip'", calls)
         self.assertNotIn("'install'", calls)
+
+    def test_enabling_vision_installs_optional_extra_in_existing_environment(self):
+        calls = self.run_setup("3.13", True, vision="1")
+        self.assertIn("'.[vision]'", calls)
