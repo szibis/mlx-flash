@@ -21,6 +21,18 @@ STATE_DIR = ROOT / ".local" / "runtime"
 PID_FILE = STATE_DIR / "server.json"
 LOG_FILE = STATE_DIR / "server.log"
 DEFAULT_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+DEFAULT_VISION_MODEL = "mlx-community/gemma-4-e4b-it-4bit"
+
+
+def vision_enabled() -> bool:
+    value = os.environ.get("MLX_FLASH_VISION", "0")
+    if value not in {"0", "1"}:
+        raise RuntimeError("MLX_FLASH_VISION must be 0 or 1.")
+    return value == "1"
+
+
+def model_ready(health: dict | None) -> bool:
+    return bool(health and (health.get("model_loaded") is True or health.get("model_available") is True))
 
 
 def require_supported_host(system: str, machine: str) -> None:
@@ -33,8 +45,8 @@ def require_supported_host(system: str, machine: str) -> None:
         raise RuntimeError("This Python is running as Intel/Rosetta. Open Terminal without Rosetta and try again.")
 
 
-def server_command(python: str, model: str, host: str, port: int) -> list[str]:
-    return [
+def server_command(python: str, model: str, host: str, port: int, *, vision: bool = False) -> list[str]:
+    command = [
         python,
         "-m",
         "mlx_flash_compress.serve",
@@ -46,6 +58,9 @@ def server_command(python: str, model: str, host: str, port: int) -> list[str]:
         str(port),
         "--preload",
     ]
+    if vision:
+        command.extend(["--vision", "--prompt-cache-bytes", "0"])
+    return command
 
 
 def managed_server_command(command: str, port: int) -> bool:
@@ -62,10 +77,12 @@ def managed_server_command(command: str, port: int) -> bool:
 
 
 def _config() -> tuple[str, str, int, int]:
-    model = os.environ.get("MLX_FLASH_MODEL", DEFAULT_MODEL).strip()
+    vision = vision_enabled()
+    default_model = DEFAULT_VISION_MODEL if vision else DEFAULT_MODEL
+    model = os.environ.get("MLX_FLASH_MODEL", default_model).strip()
     host = os.environ.get("MLX_FLASH_HOST", "127.0.0.1").strip()
     try:
-        port = int(os.environ.get("MLX_FLASH_PORT", "8080"))
+        port = int(os.environ.get("MLX_FLASH_PORT", "8082" if vision else "8080"))
         startup_timeout = int(os.environ.get("MLX_FLASH_STARTUP_TIMEOUT", "900"))
     except ValueError:
         raise RuntimeError("Port and startup timeout must be whole numbers.") from None
@@ -194,7 +211,10 @@ def up() -> int:
     model, host, port, timeout = _config()
     if not _health(host, port) and _port_open(host, port):
         raise RuntimeError(f"Port {port} is already used by another program. Close it or choose MLX_FLASH_PORT.")
-    if _health(host, port):
+    health = _health(host, port)
+    if health:
+        if vision_enabled() and (health.get("runtime") != "mlx_vlm" or health.get("model") != model):
+            raise RuntimeError("An API with a different model/runtime is already running. Stop its managed process or choose another port.")
         print(f"MLX-Flash API is already running: http://{host}:{port}/v1")
         return 0
 
@@ -204,7 +224,7 @@ def up() -> int:
     _docker_compose("--profile", "monitoring", "up", "-d", "prometheus", "grafana")
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    command = server_command(sys.executable, model, host, port)
+    command = server_command(sys.executable, model, host, port, vision=vision_enabled())
     log_handle = LOG_FILE.open("ab", buffering=0)
     process = subprocess.Popen(
         command,
@@ -228,7 +248,7 @@ def up() -> int:
     try:
         while time.monotonic() < deadline:
             health = _health(host, port)
-            if health and health.get("model_loaded") is True:
+            if model_ready(health):
                 print(f"API ready: http://{host}:{port}/v1")
                 print(f"Admin: http://{host}:{port}/admin · Logs: {LOG_FILE.relative_to(ROOT)}")
                 print("Monitoring: http://localhost:3000 (Grafana) · http://localhost:9090 (Prometheus)")
@@ -271,7 +291,7 @@ def down_server() -> None:
 def status() -> int:
     model, host, port, _ = _config()
     health = _health(host, port)
-    if health and health.get("model_loaded") is True:
+    if model_ready(health):
         print(f"READY — {health.get('model', model)} at http://{host}:{port}/chat")
         result = 0
     elif _port_open(host, port) and _managed_pid(_read_pid_record() or {"pid": -1}, port):

@@ -99,7 +99,7 @@ def loads_json(raw: bytes | str) -> Any:
         raise APIRequestError("Request body must be valid JSON without duplicate keys or non-finite numbers.") from None
 
 
-def validate_chat_request(data: dict[str, Any]) -> None:
+def validate_chat_request(data: dict[str, Any], *, vision: bool = False) -> None:
     supported = {
         "model",
         "messages",
@@ -132,12 +132,16 @@ def validate_chat_request(data: dict[str, Any]) -> None:
             raise APIRequestError(f"messages[{index}] has an unsupported shape.")
         if not isinstance(message.get("role"), str) or message["role"] not in allowed_roles:
             raise APIRequestError(f"messages[{index}].role is unsupported.")
-        if not isinstance(message.get("content"), str):
+        if not isinstance(message.get("content"), str) and not (vision and isinstance(message.get("content"), list)):
             raise APIRequestError(
                 "Image and non-text message content is not available in this server build.", code="unsupported_modality"
             )
         if "name" in message and (not isinstance(message["name"], str) or len(message["name"]) > 128):
             raise APIRequestError(f"messages[{index}].name must be a string of at most 128 characters.")
+    if vision:
+        from mlx_flash_compress.vision_runtime import prepare_vision_messages
+
+        prepare_vision_messages(messages)
     max_tokens = data.get("max_completion_tokens", data.get("max_tokens", 256))
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 1 <= max_tokens <= 8192:
         raise APIRequestError("max_tokens must be an integer from 1 to 8192.")
@@ -158,13 +162,13 @@ class ResponseFormat:
     strict: bool = False
 
 
-def api_capabilities() -> dict[str, Any]:
+def api_capabilities(*, vision: bool = False) -> dict[str, Any]:
     """Return a machine-readable inventory; never imply image support via chat text."""
     return {
         "object": "mlx_flash.capabilities",
         "api_version": "1",
         "endpoints": {
-            "chat_completions": {"supported": True, "streaming": True},
+            "chat_completions": {"supported": True, "streaming": not vision},
             "models": {"supported": True},
             "responses": {"supported": True, "streaming": False, "input": ["text", "simple_messages"]},
             "completions": {"supported": True, "streaming": False, "prompt": "string"},
@@ -179,7 +183,26 @@ def api_capabilities() -> dict[str, Any]:
             "output_limit_bytes": MAX_STRUCTURED_OUTPUT_BYTES,
             "streaming": False,
         },
-        "vision": {"supported": False, "reason": "text_generation_adapter_only", "modalities": ["text"]},
+        "vision": (
+            {
+                "supported": True,
+                "adapter": "mlx_vlm",
+                "modalities": ["text", "image"],
+                "input": ["image_url_data_url"],
+                "formats": ["png", "jpeg"],
+                "max_images": 1,
+                "max_image_bytes": 4194304,
+                "max_image_pixels": 4194304,
+                "resident_between_requests": False,
+                "concurrency": 1,
+            }
+            if vision
+            else {
+                "supported": False,
+                "reason": "text_generation_adapter_only_or_vision_not_loaded",
+                "modalities": ["text"],
+            }
+        ),
         "image_operations": {"supported": False, "reason": "no_native_image_operation_adapter", "operations": []},
     }
 

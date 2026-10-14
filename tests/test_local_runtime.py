@@ -1,6 +1,8 @@
 """Tests for the one-command native MLX + Docker runtime launcher."""
 
+import io
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from scripts import local_runtime
@@ -27,6 +29,16 @@ class HostValidationTests(unittest.TestCase):
 
 
 class NativeServerCommandTests(unittest.TestCase):
+    def test_vision_command_is_explicit_and_disables_prompt_reuse(self):
+        command = server_command("python", "test/vision", "127.0.0.1", 8082, vision=True)
+        self.assertIn("--vision", command)
+        self.assertEqual(command[-2:], ["--prompt-cache-bytes", "0"])
+
+    def test_vision_environment_selects_gemma_e4b_default(self):
+        with patch.dict("os.environ", {"MLX_FLASH_VISION": "1"}, clear=True):
+            self.assertEqual(_config()[0], "mlx-community/gemma-4-e4b-it-4bit")
+            self.assertEqual(_config()[2], 8082)
+
     def test_builds_native_server_command_with_preload(self):
         self.assertEqual(
             server_command(".venv/bin/python", "mlx-community/tiny-model", "127.0.0.1", 8080),
@@ -73,6 +85,18 @@ class DockerReadinessTests(unittest.TestCase):
 
 
 class HeadlessStartupTests(unittest.TestCase):
+    def test_vision_status_accepts_verified_nonresident_model(self):
+        output = io.StringIO()
+        with (
+            patch.object(
+                local_runtime, "_health", return_value={"status": "ok", "model_available": True, "model_loaded": False}
+            ),
+            patch.object(local_runtime, "_docker_compose"),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(local_runtime.status(), 0)
+        self.assertIn("READY", output.getvalue())
+
     def test_starting_an_existing_api_never_opens_a_browser(self):
         with (
             patch.object(local_runtime, "require_supported_host"),
