@@ -35,6 +35,7 @@ dependencies = [
 
 [project.optional-dependencies]
 vision = ["mlx-vlm>=0.7.6,<0.8", "Pillow>=10.0"]
+image-edit = ["mflux==0.23.0", "mlx>=0.32.4", "Pillow>=10.0"]
 compression = [
     "lz4>=4.3.0",
     "zstandard>=0.23.0",
@@ -60,6 +61,7 @@ mlx-flash = "mlx_flash_compress.serve:main"
 mlx-flash-chat = "mlx_flash_compress.chat:main"
 mlx-flash-bench = "mlx_flash_compress.bench:main"
 mlx-flash-browse = "mlx_flash_compress.model_browser:main"
+mlx-flash-image-edit = "mlx_flash_compress.image_edit:main"
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]

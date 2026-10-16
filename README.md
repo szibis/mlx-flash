@@ -9,6 +9,9 @@ cache/session/accounting/SSE contract gate, real Metal evidence and local comman
 
 The Chat Completions server supports [request-scoped Qwen thinking profiles](docs/chat-profiles.md) through `chat_template_kwargs.enable_thinking`.
 
+For optional native image editing with a prepared local checkpoint, see the
+[bounded MLX image-edit prototype](docs/image-edit.md).
+
 For server token counts, sampling, EOS versus truncation, and buffered SSE, see
 [native generation measurements and examples](docs/generation-measurements.md).
 These metrics support Sentinel's routing/evaluation records; they do not price
