@@ -58,6 +58,101 @@ The receipt records decoded scene/matte/output pixel hashes,
 and `visual_quality_approved: false`. These fields distinguish recoloring an
 existing scene from extracting a transparent shadow layer.
 
+## Optional local edge decontamination
+
+The default alpha-weighted adjustment can retain a bright old backdrop inside
+fractional edge pixels. For supported edges, opt into a local inverse-compositing
+approximation instead:
+
+```python
+recolored, receipt = recolor_studio_scene(
+    scene, matte, [32, 40, 35], edge_mode="local_unmix"
+)
+```
+
+This CPU path changes RGB only. It never erodes, widens, blurs or edits the supplied
+alpha, and never blurs the source. Fully opaque scene pixels remain exact;
+zero-alpha scene pixels retain exactly the default recolor's gradients and shadow.
+Unsupported partial edges also retain the default result. The default API and
+its `studio-background-recolor-v1` receipt remain unchanged.
+
+For a partial pixel, approximate its original mixture as `C = a*F + (1-a)*B`.
+The optional result is `C + (1-a)*(gain-1)*B_local`, replacing only the estimated
+old backdrop contribution. This uses display RGB and is not calibrated physical
+relighting. An incorrect matte, a refractive surface or old backdrop classified
+as opaque cannot be repaired by this formula.
+
+`B_local` uses only strict zero-alpha pixels in a small local window, with at
+least four samples, light/near-neutral color and low per-channel variation.
+Partial alpha must be at least 32/255. Recovered foreground color must lie near
+the RGB gamut and agree with the nearest fully opaque scene anchor within the
+same radius. The radius scales with dimensions, bounded to 3–8 pixels. The
+candidate is refused per pixel if it differs from the default floating-point
+result by more than 64 in any channel. Parameters and rejection counters are
+included in the receipt; no global surface fit is required.
+
+The new receipt uses `studio-background-recolor-v2` and method
+`display-rgb-local-edge-unmix-v1`. Nested `edge_correction` reports evidence
+support, `eligible_pixels`, actual raster `corrected_pixels`, target-specific
+`correction_limit_refused_pixels`, hashes and quality flags. `estimated` means
+some edge evidence passed the gates, not that every edge or glass is correct.
+Both `visual_quality_approved` and `alignment_verified` remain false.
+
+### Cache evidence for live color controls
+
+`prepare_studio_edge_correction(scene, matte)` returns an RGBA evidence map and
+JSON-safe receipt without choosing a target. Map RGB is the quantized local
+backdrop estimate; map A=255 marks accepted partial edges, with zero elsewhere.
+This alpha is evidence support, **not a replacement matte**. Bind the cached map
+to the source/matte pixel hashes and dimensions, and invalidate it after any
+source or mask edit. The method is `local-inverse-compositing-evidence-v1`, with
+provenance `local_scene_background_estimate`.
+
+A browser can replay the exact arithmetic using the existing recolor reference
+and the evidence map. Compare the unrounded candidates before applying the
+64-channel bound, then assign to a `Uint8ClampedArray` (round-to-even and clamp):
+
+```javascript
+const output = new Uint8ClampedArray(scenePixels);
+for (let i = 0; i < output.length; i += 4) {
+  const a = mattePixels[i + 3] / 255;
+  const base = [], candidate = [];
+  for (let c = 0; c < 3; c++) {
+    const gain = target[c] / receipt.reference_rgb[c];
+    base[c] = scenePixels[i + c] * (a + (1 - a) * gain);
+    candidate[c] = scenePixels[i + c]
+      + (1 - a) * (gain - 1) * basisPixels[i + c];
+  }
+  const supported = basisPixels[i + 3] === 255
+    && candidate.every((v, c) => Math.abs(v - base[c]) <= 64);
+  for (let c = 0; c < 3; c++) {
+    output[i + c] = supported ? candidate[c] : base[c];
+  }
+}
+```
+
+Do not treat semantic segmentation confidence as physical coverage. Glass may
+refract a different background position, and isolated fractional details may
+lack opaque evidence. These are explicitly unresolved; there is no guarantee
+that a glass edge is detected and refused. Keep the mode opt-in, show skipped
+edge flags, and visually inspect light, dark and saturated backdrops. Source RGB
+already marked opaque is protected even when it contains an unwanted fringe.
+
+### Research boundary
+
+Alpha alone does not recover uncontaminated foreground color; separate color
+estimation is discussed in [Foreground color prediction through inverse
+compositing](https://arxiv.org/abs/2103.13423). [PyMatting's foreground-estimation
+API](https://pymatting.github.io/foreground.html) likewise estimates foreground
+and optional background from the image and alpha. This implementation is a
+bounded local analytic approximation; it does not implement those neural or
+global optimization algorithms or inherit their reported results.
+
+For transparent objects, [TOM-Net](https://openaccess.thecvf.com/content_cvpr_2018/html/Chen_TOM-Net_Learning_Transparent_CVPR_2018_paper.html)
+models attenuation and refractive flow in addition to an object mask. No such
+glass reconstruction is performed here. See the [edge verification proof](testing/studio-edge-decontamination-2026-10-16.md)
+for controlled tests and remaining uncertainty.
+
 ## Conservative transparent layer decomposition
 
 `decompose_studio_scene` separates a supported light, neutral RGB studio scene

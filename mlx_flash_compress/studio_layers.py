@@ -167,14 +167,58 @@ def decompose_studio_scene(scene_rgb, foreground_rgba):
     return foreground_rgba.copy(), shadow, receipt
 
 
-def recolor_studio_scene(scene_rgb, foreground_rgba, target_rgb):
+def prepare_studio_edge_correction(scene_rgb, foreground_rgba):
+    """Return a target-independent local background evidence map and receipt.
+
+    Map RGB stores a bounded B estimate and A=255 marks supported partial edge
+    pixels only. Alpha is confidence, not a replacement foreground matte.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from ._studio_edges import prepare
+
+    if (
+        not isinstance(scene_rgb, Image.Image)
+        or not isinstance(foreground_rgba, Image.Image)
+        or scene_rgb.mode != "RGB"
+        or foreground_rgba.mode != "RGBA"
+        or scene_rgb.size != foreground_rgba.size
+        or min(scene_rgb.size) < 32
+        or max(scene_rgb.size) > 1600
+    ):
+        raise StudioLayersError("invalid_request", "Provide aligned RGB/RGBA PIL images, 32–1600 pixels per side.")
+    pixels, stats = prepare(np.asarray(scene_rgb, dtype=np.float64), np.asarray(foreground_rgba.getchannel("A")))
+    basis = Image.fromarray(pixels)
+    receipt = {
+        "version": "studio-edge-basis-v1",
+        "method": "local-inverse-compositing-evidence-v1",
+        "provenance": "local_scene_background_estimate",
+        "width": scene_rgb.width,
+        "height": scene_rgb.height,
+        "alignment_required": True,
+        "alignment_verified": False,
+        "visual_quality_approved": False,
+        **stats,
+        "scene_pixels_sha256": hashlib.sha256(scene_rgb.tobytes()).hexdigest(),
+        "matte_pixels_sha256": hashlib.sha256(foreground_rgba.tobytes()).hexdigest(),
+        "basis_pixels_sha256": hashlib.sha256(basis.tobytes()).hexdigest(),
+    }
+    return basis, receipt
+
+
+def recolor_studio_scene(scene_rgb, foreground_rgba, target_rgb, *, edge_mode="none"):
     """Recolor the masked backdrop while retaining scene geometry and darkness.
 
-    This does not extract a shadow or reconstruct foreground RGB. The supplied
-    matte must already be aligned; its alpha controls channel-gain blending.
+    This does not extract a shadow or replace foreground RGB. The supplied
+    matte must already be aligned. ``local_unmix`` optionally replaces a
+    supported partial edge's estimated original backdrop contribution only.
     """
     import numpy as np
     from PIL import Image, ImageFilter
+
+    if not isinstance(edge_mode, str) or edge_mode not in {"none", "local_unmix"}:
+        raise StudioLayersError("invalid_request", "Choose an available edge correction mode.")
 
     if (
         not isinstance(scene_rgb, Image.Image)
@@ -208,7 +252,23 @@ def recolor_studio_scene(scene_rgb, foreground_rgba, target_rgb):
     gains = np.asarray(target_rgb, dtype=np.float64) / reference
     # Reference channels are >=128, so every legal target has gain <=2.
     # Apply exactly the same arithmetic/order as the documented browser formula.
-    corrected = np.clip(np.rint(rgb * (alpha[..., None] + (1 - alpha[..., None]) * gains)), 0, 255).astype(np.uint8)
+    base = rgb * (alpha[..., None] + (1 - alpha[..., None]) * gains)
+    edge_receipt = None
+    if edge_mode == "local_unmix":
+        basis, edge_receipt = prepare_studio_edge_correction(scene_rgb, foreground_rgba)
+        evidence = np.asarray(basis)
+        # C=aF+(1-a)B -> C'=C+(1-a)(gain-1)B. No F reconstruction
+        # or alpha change is needed to replace just the original B contribution.
+        unmixed = rgb + (1 - alpha[..., None]) * (gains - 1) * evidence[..., :3]
+        allowed = (evidence[..., 3] == 255) & (np.max(np.abs(unmixed - base), axis=2) <= 64)
+        edge_receipt["eligible_pixels"] = int(allowed.sum())
+        changed = np.any(np.clip(np.rint(unmixed), 0, 255) != np.clip(np.rint(base), 0, 255), axis=2)
+        edge_receipt["corrected_pixels"] = int((allowed & changed).sum())
+        edge_receipt["correction_limit_refused_pixels"] = int(((evidence[..., 3] == 255) & ~allowed).sum())
+        if edge_receipt["correction_limit_refused_pixels"]:
+            edge_receipt["quality_flags"].append("correction_bound_exceeded")
+        base = np.where(allowed[..., None], unmixed, base)
+    corrected = np.clip(np.rint(base), 0, 255).astype(np.uint8)
     output = Image.fromarray(corrected)
     receipt = {
         "version": "studio-background-recolor-v1",
@@ -234,4 +294,11 @@ def recolor_studio_scene(scene_rgb, foreground_rgba, target_rgb):
         "matte_pixels_sha256": hashlib.sha256(foreground_rgba.tobytes()).hexdigest(),
         "output_pixels_sha256": hashlib.sha256(output.tobytes()).hexdigest(),
     }
+    if edge_receipt is not None:
+        receipt.update(
+            version="studio-background-recolor-v2",
+            method="display-rgb-local-edge-unmix-v1",
+            edge_mode=edge_mode,
+            edge_correction=edge_receipt,
+        )
     return output, receipt

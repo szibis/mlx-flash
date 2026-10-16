@@ -127,6 +127,7 @@ still needs review before a caller applies or publishes it.
 | Image understanding | Optional `--vision` server, native `mlx-vlm`/Metal | Describe an image or return structured observations. It does not edit pixels. See [vision API](docs/vision-api.md). |
 | Reference-conditioned image generation/editing | Bounded `mlx-flash-image-edit` CLI/Python API, native MFLUX/MLX/Metal | Generate a new RGB image from a prompt and 1–4 references using a prepared local 4-bit FLUX.2 Klein 4B checkpoint. This is a prototype, with no guarantee of faithful object preservation. See [image-edit guide](docs/image-edit.md). |
 | Live masked background color | `recolor_studio_scene`, CPU NumPy/Pillow | Change backdrop color while retaining existing gradients and rendered shadow. Requires a caller-supplied aligned matte; opaque scene pixels stay exact. Color targets are approximate. |
+| Optional edge decontamination | `edge_mode="local_unmix"`, CPU, with a reusable evidence map | Reduce old bright-backdrop contamination at supported partial edges without changing alpha or geometry. Uncertain edges retain the default recolor; glass is not reconstructed. |
 | Transparent foreground/shadow layers | Experimental `decompose_studio_scene`, CPU | Estimate observed attenuation on a light neutral smooth studio backdrop. It refuses uncertain scenes with `needs_review`; it never fabricates a replacement shadow or claims an original photographic shadow. |
 
 The CPU tools are described in [studio-scene layers](docs/studio-layers.md).
@@ -155,7 +156,8 @@ training in these tools. Prompt/configuration changes do not train model weights
 Native image-model smoke tests were run on an **M5 Pro with 64 GiB**; image editing
 on an **M4 with 16 GiB is unverified**. The 8 GiB MLX allocation limit does not cap
 total process or system memory. See the [native generation proof](docs/testing/image-edit-prototype-2026-10-16.md),
-[CPU studio-tools proof](docs/testing/studio-scene-tools-2026-10-16.md)
+[CPU studio-tools proof](docs/testing/studio-scene-tools-2026-10-16.md) and
+[opt-in edge proof](docs/testing/studio-edge-decontamination-2026-10-16.md)
 for measured scope, skips and visual-quality limits.
 
 ## What MLX-Flash Actually Does Differently
