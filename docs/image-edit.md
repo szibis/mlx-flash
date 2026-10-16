@@ -6,10 +6,12 @@ there is no image-edit HTTP endpoint and it does not require an LLM to plan the
 request. The output is generated content; reference-image fidelity requires
 inspection by the caller.
 
-Install the optional dependencies in an isolated macOS environment:
+Install the optional dependencies from the current source checkout in an
+isolated macOS environment. These instructions do not assume that the latest
+PyPI release already contains this prototype:
 
 ```sh
-python -m pip install 'mlx-flash[image-edit]'
+python -m pip install -e '.[image-edit]'
 ```
 
 Prepare a complete, trusted local **4-bit FLUX.2 Klein 4B MFLUX checkpoint**

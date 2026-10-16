@@ -9,9 +9,6 @@ cache/session/accounting/SSE contract gate, real Metal evidence and local comman
 
 The Chat Completions server supports [request-scoped Qwen thinking profiles](docs/chat-profiles.md) through `chat_template_kwargs.enable_thinking`.
 
-For optional native image editing with a prepared local checkpoint, see the
-[bounded MLX image-edit prototype](docs/image-edit.md).
-
 For server token counts, sampling, EOS versus truncation, and buffered SSE, see
 [native generation measurements and examples](docs/generation-measurements.md).
 These metrics support Sentinel's routing/evaluation records; they do not price
@@ -117,6 +114,49 @@ mlx-flash --port 8080
 MLX-Flash auto-detects your hardware, picks the best Gemma 4 model for your RAM, and starts serving.
 
 > **From source:** `git clone https://github.com/szibis/MLX-Flash.git && cd MLX-Flash && pip install -e ".[all]"`
+
+## Images: understanding, editing and live backdrop controls
+
+MLX-Flash includes separate tools for interpreting images, generating edits and
+adjusting an existing studio scene. They can support catalog/ecommerce tooling,
+local creative editors and orchestrators such as LLM Sentinel. A generated edit
+still needs review before a caller applies or publishes it.
+
+| Capability | Interface and execution | Suitable uses and limits |
+| --- | --- | --- |
+| Image understanding | Optional `--vision` server, native `mlx-vlm`/Metal | Describe an image or return structured observations. It does not edit pixels. See [vision API](docs/vision-api.md). |
+| Reference-conditioned image generation/editing | Bounded `mlx-flash-image-edit` CLI/Python API, native MFLUX/MLX/Metal | Generate a new RGB image from a prompt and 1–4 references using a prepared local 4-bit FLUX.2 Klein 4B checkpoint. This is a prototype, with no guarantee of faithful object preservation. See [image-edit guide](docs/image-edit.md). |
+| Live masked background color | `recolor_studio_scene`, CPU NumPy/Pillow | Change backdrop color while retaining existing gradients and rendered shadow. Requires a caller-supplied aligned matte; opaque scene pixels stay exact. Color targets are approximate. |
+| Transparent foreground/shadow layers | Experimental `decompose_studio_scene`, CPU | Estimate observed attenuation on a light neutral smooth studio backdrop. It refuses uncertain scenes with `needs_review`; it never fabricates a replacement shadow or claims an original photographic shadow. |
+
+The CPU tools are described in [studio-scene layers](docs/studio-layers.md).
+Source images are immutable inputs; generated files, supplied masks, edge
+estimates and recolored previews need operator review. Mask alignment and fine
+details, translucent materials and visible glass remain caller responsibilities.
+
+Install these optional tools from the current source checkout; this does not
+assume a PyPI release already contains them:
+
+```sh
+python -m pip install -e '.[image-edit]'
+mlx-flash-image-edit --model-path /path/to/local/klein-4b-4bit \
+  --input reference.png --output new-edit.png \
+  --prompt 'Use a softly lit neutral studio backdrop.' \
+  --seed 42 --width 512 --height 640 --steps 4
+```
+
+The CLI emits NDJSON progress and a hashed result receipt, including model and
+prompt fingerprints, actual steps, timing and memory measurements. It does not
+download weights during inference. Any orchestrator can consume that subprocess
+contract; the caller must serialize heavy resident models and own cancellation.
+There is no image-edit HTTP endpoint, automatic Sentinel model handoff or model
+training in these tools. Prompt/configuration changes do not train model weights.
+
+Native image-model smoke tests were run on an **M5 Pro with 64 GiB**; image editing
+on an **M4 with 16 GiB is unverified**. The 8 GiB MLX allocation limit does not cap
+total process or system memory. See the [native generation proof](docs/testing/image-edit-prototype-2026-10-16.md),
+[CPU studio-tools proof](docs/testing/studio-scene-tools-2026-10-16.md)
+for measured scope, skips and visual-quality limits.
 
 ## What MLX-Flash Actually Does Differently
 
