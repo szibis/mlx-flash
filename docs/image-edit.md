@@ -151,3 +151,9 @@ completed-step events and memory accounting; it does not score appearance.
 
 Current model-free coverage, full-suite results and the separately enabled
 native Metal smoke are recorded in the [prototype verification proof](testing/image-edit-prototype-2026-10-16.md).
+
+For an experimental way to retain a supplied foreground and estimated generated
+scene shadow over live backdrop colors, see [studio-scene layers](studio-layers.md).
+This separate CPU API requires an aligned matte and refuses uncertain scenes.
+The same module also supports masked RGB backdrop recoloring, retaining the
+generated scene's existing gradients and shadow without requiring decomposition.
