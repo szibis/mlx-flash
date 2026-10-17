@@ -4,6 +4,15 @@ All notable changes to MLX-Flash are documented here.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-16
+
+### Changes
+- Add bounded OpenAI text API and headless local workbench (#28)
+- feat: optional native vision chat runtime (#29)
+- feat: native image editing and controllable studio backgrounds (#30)
+- docs: explain image workflows and general use cases (#31)
+- feat: add conservative opt-in studio edge decontamination (#32)
+
 ## [0.9.2] - 2026-10-07
 
 ### Changes
