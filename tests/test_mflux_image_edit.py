@@ -2,10 +2,37 @@
 
 import importlib
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
 from PIL import Image
+
+
+def test_native_reference_budget_is_scoped_and_restored_after_failure(monkeypatch):
+    module = importlib.import_module("mlx_flash_compress._mflux_image_edit")
+    helper = SimpleNamespace(MAX_REFERENCE_AREA=1024**2)
+    name = "mflux.models.flux2.variants.edit.flux2_klein_edit_helpers"
+    monkeypatch.setitem(sys.modules, name, helper)
+    with module._reference_budget(1600**2):
+        assert helper.MAX_REFERENCE_AREA == 1600**2
+    assert helper.MAX_REFERENCE_AREA == 1024**2
+    with pytest.raises(RuntimeError):
+        with module._reference_budget(1600**2):
+            assert helper.MAX_REFERENCE_AREA == 1600**2
+            raise RuntimeError("generation failed")
+    assert helper.MAX_REFERENCE_AREA == 1024**2
+    with module._reference_budget(None):
+        assert helper.MAX_REFERENCE_AREA == 1024**2
+
+
+@pytest.mark.parametrize("area", [True, 0, 768**2, 1600**2 + 1])
+def test_invalid_native_reference_budget_fails_closed(area):
+    module = importlib.import_module("mlx_flash_compress._mflux_image_edit")
+    api = importlib.import_module("mlx_flash_compress.image_edit")
+    with pytest.raises(api.ImageEditError):
+        with module._reference_budget(area):
+            pytest.fail("Invalid budget reached model")
 
 
 def test_native_adapter_reports_completed_steps_and_preserves_loading_peak(monkeypatch, tmp_path):

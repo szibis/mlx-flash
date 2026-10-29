@@ -35,13 +35,15 @@ def _sha(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
-def _validate_parameters(prompt, seed, width, height, steps):
+def _validate_parameters(prompt, seed, width, height, steps, max_dimension=768):
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 4000 or "\0" in prompt:
         _fail("Provide a prompt of 1–4000 characters.")
     if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
         _fail("Seed must be an unsigned 32-bit integer.")
-    if any(type(v) is not int or not 256 <= v <= 768 or v % 16 for v in (width, height)):
-        _fail("Dimensions must be multiples of 16 between 256 and 768.")
+    if type(max_dimension) is not int or not 256 <= max_dimension <= 1600 or max_dimension % 16:
+        _fail("Resolution budget must be a multiple of 16 between 256 and 1600.")
+    if any(type(v) is not int or not 256 <= v <= max_dimension or v % 16 for v in (width, height)):
+        _fail("Dimensions must be multiples of 16 within the explicit resolution budget.")
     if type(steps) is not int or not 1 <= steps <= 8:
         _fail("Steps must be an integer between 1 and 8.")
 
@@ -85,7 +87,7 @@ def _model_identity(model_path):
         _fail("Model must be a complete prepared local directory.")
 
 
-def _prepare_references(inputs, directory):
+def _prepare_references(inputs, directory, max_dimension=768):
     from PIL import Image, ImageOps
 
     if isinstance(inputs, (str, os.PathLike, bytes)):
@@ -111,7 +113,7 @@ def _prepare_references(inputs, directory):
                     _fail("Reference dimensions exceed prototype limits.")
                 original.load()
                 image = ImageOps.exif_transpose(original).convert("RGBA")
-            image.thumbnail((768, 768), Image.Resampling.LANCZOS)
+            image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
             size = tuple(((v + 15) // 16) * 16 for v in image.size)
             # Preserve the whole reference: pad the sub-16 remainder instead of
             # letting MFLUX center-crop thin details at the source boundaries.
@@ -127,6 +129,8 @@ def _prepare_references(inputs, directory):
             raise
         except Exception:
             _fail("Reference image could not be decoded safely.")
+    if max_dimension > 768 and sum(c["width"] * c["height"] for c in conditions) > max_dimension**2:
+        _fail("Combined reference images exceed the native-resolution area budget.")
     return paths, hashes, conditions
 
 
@@ -149,7 +153,19 @@ def _write_output(image, destination):
         Path(name).unlink(missing_ok=True)
 
 
-def edit_image(input_path, output_path, model_path, prompt, *, seed=42, width=512, height=640, steps=4, progress=None):
+def edit_image(
+    input_path,
+    output_path,
+    model_path,
+    prompt,
+    *,
+    seed=42,
+    width=512,
+    height=640,
+    steps=4,
+    progress=None,
+    max_dimension=768,
+):
     """Generate a PNG and receipt from local references, without downloading.
 
     ``input_path`` accepts a path, encoded bytes, or a list of up to four of
@@ -157,7 +173,7 @@ def edit_image(input_path, output_path, model_path, prompt, *, seed=42, width=51
     assert product fidelity or visual acceptance. Use an isolated CLI process;
     its exit releases the Metal context as well as all model objects.
     """
-    _validate_parameters(prompt, seed, width, height, steps)
+    _validate_parameters(prompt, seed, width, height, steps, max_dimension)
     started = time.monotonic()
     try:
         destination = Path(output_path).expanduser().absolute()
@@ -175,7 +191,7 @@ def edit_image(input_path, output_path, model_path, prompt, *, seed=42, width=51
 
     try:
         with tempfile.TemporaryDirectory(prefix="mlx-image-edit-") as temporary:
-            paths, hashes, conditions = _prepare_references(input_path, temporary)
+            paths, hashes, conditions = _prepare_references(input_path, temporary, max_dimension)
             root, model_sha = _model_identity(model_path)
             # Upstream diagnostics can contain private prompt/path data. Only
             # structured, allowlisted progress is forwarded to the caller.
@@ -189,6 +205,7 @@ def edit_image(input_path, output_path, model_path, prompt, *, seed=42, width=51
                     height=height,
                     steps=steps,
                     emit=emit,
+                    **({"reference_max_area": max_dimension**2} if max_dimension > 768 else {}),
                 )
             if image.size != (width, height):
                 raise ImageEditError("invalid_output", "Backend returned unexpected output dimensions.")
@@ -207,6 +224,7 @@ def edit_image(input_path, output_path, model_path, prompt, *, seed=42, width=51
                 "format": "png",
                 "width": width,
                 "height": height,
+                "max_dimension": max_dimension,
                 "seed": seed,
                 "steps": steps,
                 "guidance": 1.0,
@@ -253,6 +271,12 @@ def main(argv=None):
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=640)
     parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument(
+        "--max-dimension",
+        type=int,
+        default=768,
+        help="Explicit input/output edge budget, 256–1600 in multiples of 16; higher values need more memory/time",
+    )
     try:
         args = parser.parse_args(argv)
         result = edit_image(
@@ -265,6 +289,7 @@ def main(argv=None):
             height=args.height,
             steps=args.steps,
             progress=send,
+            max_dimension=args.max_dimension,
         )
         send({"type": "result", "receipt": result})
         return 0
