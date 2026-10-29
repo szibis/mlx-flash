@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
+import importlib
 import importlib.metadata
 import os
 import resource
@@ -61,7 +63,30 @@ class _Progress:
         self.emit("decode")
 
 
-def run(*, model_path, image_paths, prompt, seed, width, height, steps, emit):
+@contextlib.contextmanager
+def _reference_budget(area):
+    """Scoped override for pinned MFLUX's otherwise silent 1 MP downscale.
+
+    This adapter runs one request in an isolated process. Never change the
+    installed dependency, and restore its default even when generation fails.
+    """
+    if area is None:
+        yield
+        return
+    from .image_edit import ImageEditError
+
+    if type(area) is not int or not 768**2 < area <= 1600**2:
+        raise ImageEditError("invalid_request", "Invalid reference area budget.")
+    module = importlib.import_module("mflux.models.flux2.variants.edit.flux2_klein_edit_helpers")
+    previous = module.MAX_REFERENCE_AREA
+    try:
+        module.MAX_REFERENCE_AREA = area
+        yield
+    finally:
+        module.MAX_REFERENCE_AREA = previous
+
+
+def run(*, model_path, image_paths, prompt, seed, width, height, steps, emit, reference_max_area=None):
     from .image_edit import ImageEditError
 
     # Complete local paths plus local-only tokenizer resolution are the first
@@ -95,16 +120,17 @@ def run(*, model_path, image_paths, prompt, seed, width, height, steps, emit):
         model.callbacks.register(saver)
         model.callbacks.register(_Progress(mx, emit, steps))
         emit("conditioning")
-        generated = model.generate_image(
-            image_paths=[str(path) for path in image_paths],
-            seed=seed,
-            prompt=prompt,
-            num_inference_steps=steps,
-            width=width,
-            height=height,
-            guidance=1.0,
-            use_kv_cache=False,
-        )
+        with _reference_budget(reference_max_area):
+            generated = model.generate_image(
+                image_paths=[str(path) for path in image_paths],
+                seed=seed,
+                prompt=prompt,
+                num_inference_steps=steps,
+                width=width,
+                height=height,
+                guidance=1.0,
+                use_kv_cache=False,
+            )
         mx.synchronize()
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         statistics = {

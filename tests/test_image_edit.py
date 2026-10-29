@@ -63,6 +63,76 @@ def test_rejects_unbounded_requests_before_loading_backend(api, files, monkeypat
     assert not output.exists()
 
 
+def test_opt_in_native_resolution_preserves_reference_pixels(api, files, monkeypatch):
+    source, output, model = files
+    Image.effect_noise((1200, 1600), 80).convert("RGB").save(source)
+    original_pixels = Image.open(source).tobytes()
+
+    def backend(**kwargs):
+        assert (kwargs["width"], kwargs["height"]) == (1200, 1600)
+        assert kwargs["reference_max_area"] == 1600**2
+        with Image.open(kwargs["image_paths"][0]) as reference:
+            assert reference.size == (1200, 1600)
+            assert reference.tobytes() == original_pixels
+        return Image.new("RGB", (1200, 1600)), {}
+
+    monkeypatch.setattr(api, "_run_backend", backend)
+    receipt = api.edit_image(source, output, model, "Neutral studio", width=1200, height=1600, max_dimension=1600)
+    assert receipt["conditioning"][0]["width"] == 1200
+    assert receipt["conditioning"][0]["height"] == 1600
+    assert receipt["max_dimension"] == 1600
+    assert Image.open(output).size == (1200, 1600)
+
+
+def test_cli_forwards_native_budget_and_writes_exact_requested_dimensions(api, files, monkeypatch, capsys):
+    source, output, model = files
+    Image.new("RGB", (1200, 1600), (30, 60, 90)).save(source)
+    monkeypatch.setattr(
+        api, "_run_backend", lambda **kwargs: (Image.new("RGB", (kwargs["width"], kwargs["height"])), {})
+    )
+    code = api.main(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--model-path",
+            str(model),
+            "--prompt",
+            "Neutral studio",
+            "--width",
+            "1200",
+            "--height",
+            "1600",
+            "--max-dimension",
+            "1600",
+        ]
+    )
+    assert code == 0
+    receipt = json.loads(capsys.readouterr().out.splitlines()[-1])["receipt"]
+    assert receipt["max_dimension"] == 1600
+    assert receipt["conditioning"][0]["width"] == 1200
+    assert Image.open(output).size == (1200, 1600)
+
+
+@pytest.mark.parametrize("limit", [True, 0, 769, 1616, 1.5, "1600"])
+def test_native_resolution_budget_is_validated_before_backend(api, files, monkeypatch, limit):
+    source, output, model = files
+    monkeypatch.setattr(api, "_run_backend", lambda **kwargs: pytest.fail("Unsafe budget reached backend"))
+    with pytest.raises(api.ImageEditError):
+        api.edit_image(source, output, model, "Studio", max_dimension=limit)
+    assert not output.exists()
+
+
+def test_combined_native_references_cannot_multiply_the_area_budget(api, files, monkeypatch):
+    source, output, model = files
+    Image.new("RGB", (1200, 1600), (30, 60, 90)).save(source)
+    monkeypatch.setattr(api, "_run_backend", lambda **kwargs: pytest.fail("Oversized references reached backend"))
+    with pytest.raises(api.ImageEditError, match="Combined reference"):
+        api.edit_image([source, source], output, model, "Studio", width=1200, height=1600, max_dimension=1600)
+    assert not output.exists()
+
+
 def test_generated_output_has_source_bound_receipt_and_private_progress(api, files, monkeypatch):
     source, output, model = files
     original = source.read_bytes()

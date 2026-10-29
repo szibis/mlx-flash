@@ -1,5 +1,27 @@
 # Local image-edit prototype
 
+## Opt-in native-size references and output
+
+The default remains a 768-pixel edge budget. Callers may explicitly provide
+`max_dimension=1600` (CLI: `--max-dimension 1600`) together with output dimensions
+such as `width=1200, height=1600`. Budgets must be integer multiples of 16 between
+256 and 1600. Combined prepared reference area in this mode cannot exceed the
+square of the edge budget. Invalid requests fail before loading the backend.
+
+This budget applies to both reference preparation and output generation. The
+adapter scopes pinned MFLUX's internal reference-area budget to this one request
+and restores it on success or failure; otherwise MFLUX would silently reduce a
+native-size reference to approximately 1 MP. Installed dependency files are never
+modified. Use this API in an isolated single-request process as documented below.
+
+The receipt records the selected budget and prepared reference dimensions.
+Native-size inference is not final-image upscaling and does not guarantee content
+fidelity: generated product texture can still change. Independently inspect
+content, color and detail against the source. Higher resolutions cost additional
+memory and time; a configured MLX allocator limit is not a process-wide hard RAM
+cap. Native-size operation is not yet certified for every 16 GB Mac. Keep process
+watchdogs, serialized model access and caller-side quality checks.
+
 `mlx-flash-image-edit` runs one bounded image-edit request natively on Apple
 Silicon through MFLUX 0.23.0 and MLX. It is independent of the text/vision server:
 there is no image-edit HTTP endpoint and it does not require an LLM to plan the
@@ -35,11 +57,11 @@ mlx-flash-image-edit \
 Equivalent entry point: `python -m mlx_flash_compress.image_edit`. Repeat
 `--input` for up to four references. Inputs are still JPEG, PNG or WebP, up to
 12 MiB encoded and 40 MP per image. References are oriented, converted to RGB,
-downscaled to at most 768 pixels per side, and padded to multiples of 16 rather
+downscaled to at most 768 pixels per side by default, and padded to multiples of 16 rather
 than cropped. Input transparency is composited onto white **for conditioning
 only**; source files remain untouched. The output is a new RGB PNG.
 
-Dimensions must be multiples of 16 between 256 and 768, steps integers from 1
+By default dimensions must be multiples of 16 between 256 and 768, steps integers from 1
 through 8, seeds unsigned 32-bit integers, and prompts at most 4000 characters.
 Guidance is fixed at 1.0 and reference KV caching is disabled.
 
